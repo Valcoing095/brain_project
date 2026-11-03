@@ -8,6 +8,7 @@ mod brain;
 mod cursor_agent;
 mod macos_overlay;
 mod markdown;
+mod plan;
 mod robot;
 mod native_picker;
 mod project;
@@ -17,10 +18,11 @@ use ai::{
     scan_installed_providers_background, send_message, set_workspace, AgentSelection, AiCatalog,
     CancelFlag, ProviderEntry, ReadyState, ScanEvent, SessionState, StreamEvent,
 };
-use brain::{BrainReport, SyncMode, SyncOutcome};
+use brain::{BrainReport, ProgressTick, SyncMode, SyncOutcome};
 use cursor_agent::AgentMode;
 use display_info::DisplayInfo;
 use eframe::egui;
+use plan::WorkPlan;
 use project::{ProjectEntry, ProjectRegistry};
 use readmouse::Mouse;
 
@@ -84,6 +86,16 @@ fn ago_label(unix: u64) -> String {
     } else {
         format!("hace {} días", diff / 86_400)
     }
+}
+
+fn short_path(path: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= max_chars {
+        return path.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = chars[chars.len().saturating_sub(keep)..].iter().collect();
+    format!("…{tail}")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +182,13 @@ enum DockScreen {
     PickProvider,
     PickModel,
     Chat,
+    Plan,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplyKind {
+    Chat,
+    Plan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +235,15 @@ enum UiEvent {
     ReplyReplace { seq: u64, text: String },
     ReplyDone { seq: u64, text: String, session: SessionState },
     ReplyFailed { seq: u64, error: String },
+    WorkUpdate {
+        seq: u64,
+        source: WorkSource,
+        label: String,
+        file: Option<String>,
+        brain_tokens: Option<u32>,
+        prompt_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    },
     BrainProgress {
         brain_dir: PathBuf,
         text: String,
@@ -231,12 +259,55 @@ enum UiEvent {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkSource {
+    Brain,
+    Tokens,
+}
+
+impl WorkSource {
+    fn label(self) -> &'static str {
+        match self {
+            WorkSource::Brain => "Brain",
+            WorkSource::Tokens => "Tokens",
+        }
+    }
+}
+
+/// Estado visible mientras el robot trabaja: fuente, archivo y tokens estimados.
+#[derive(Clone)]
+struct WorkMeter {
+    source: WorkSource,
+    label: String,
+    file: Option<String>,
+    brain_tokens: u32,
+    prompt_tokens: u32,
+    output_tokens: u32,
+}
+
+impl WorkMeter {
+    fn starting() -> Self {
+        Self {
+            source: WorkSource::Brain,
+            label: "Preparando contexto…".into(),
+            file: None,
+            brain_tokens: 0,
+            prompt_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+}
+
 struct PendingReply {
     seq: u64,
     text: String,
     thinking: bool,
     started: Instant,
     cancel: CancelFlag,
+    work: WorkMeter,
+    kind: ReplyKind,
+    /// Pedido original del usuario (para titular el plan).
+    goal_hint: String,
 }
 
 /// Un chat vivo. Los dos slots siguen recibiendo respuestas aunque mires el otro.
@@ -300,6 +371,8 @@ struct OpenProject {
     chats: Vec<ChatSlot>,
     active_chat: usize,
     tab_menu_open: bool,
+    plans: Vec<WorkPlan>,
+    active_plan: Option<usize>,
 }
 
 impl OpenProject {
@@ -315,6 +388,8 @@ impl OpenProject {
             chats: vec![ChatSlot::empty(), ChatSlot::empty()],
             active_chat: 0,
             tab_menu_open: false,
+            plans: Vec::new(),
+            active_plan: None,
         }
     }
 }
@@ -355,6 +430,10 @@ struct YeisonDock {
     picker_mode: AgentMode,
     model_filter: String,
     model_pick_from_chat: bool,
+    /// Tras elegir modelo, generar un plan con el borrador actual.
+    plan_generate_after_pick: bool,
+    /// Tras elegir modelo/agente, desarrollar este plan.
+    develop_plan_id: Option<String>,
 
     expanded: bool,
     focus_input: bool,
@@ -411,6 +490,8 @@ impl YeisonDock {
             picker_mode: AgentMode::Ask,
             model_filter: String::new(),
             model_pick_from_chat: false,
+            plan_generate_after_pick: false,
+            develop_plan_id: None,
             expanded: false,
             focus_input: false,
             reply_gen: 0,
@@ -870,7 +951,7 @@ impl YeisonDock {
         self.catalog.provider(id)
     }
 
-    fn start_chat(&mut self) {
+    fn start_chat(&mut self, ctx: &egui::Context) {
         if self.active().is_none() {
             self.screen = DockScreen::PickProject;
             return;
@@ -885,18 +966,122 @@ impl YeisonDock {
             return;
         }
 
-        let cursor_mode = provider
-            .kind
-            .supports_cursor_modes()
-            .then_some(self.picker_mode);
+        let develop_id = self.develop_plan_id.clone();
+        let generate_plan = self.plan_generate_after_pick;
+        let cursor_mode = if develop_id.is_some() {
+            provider
+                .kind
+                .supports_cursor_modes()
+                .then_some(AgentMode::Agent)
+        } else if generate_plan {
+            provider
+                .kind
+                .supports_cursor_modes()
+                .then_some(AgentMode::Plan)
+        } else {
+            provider
+                .kind
+                .supports_cursor_modes()
+                .then_some(self.picker_mode)
+        };
         self.apply_agent(AgentSelection {
             provider,
             model_id: self.selected_model_id.clone(),
             cursor_mode,
         });
+        self.model_pick_from_chat = false;
+        self.plan_generate_after_pick = false;
+        self.develop_plan_id = None;
+
+        if let Some(plan_id) = develop_id {
+            self.begin_develop_plan(ctx, &plan_id);
+            return;
+        }
+        if generate_plan {
+            self.request_plan(ctx);
+            return;
+        }
         self.screen = DockScreen::Chat;
         self.focus_input = true;
-        self.model_pick_from_chat = false;
+    }
+
+    /// Pide un plan de trabajo con el borrador (o un texto guía).
+    fn request_plan(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        if project.chats[project.active_chat].agent.is_none() {
+            self.plan_generate_after_pick = true;
+            self.model_pick_from_chat = true;
+            self.picker_mode = AgentMode::Plan;
+            self.screen = DockScreen::PickProvider;
+            self.notice = Some("Elegí con qué IA generar el plan.".into());
+            return;
+        }
+        let draft = project.chats[project.active_chat].draft.trim().to_string();
+        let goal = if draft.is_empty() {
+            "Proponé un plan de trabajo útil para mejorar o avanzar este proyecto, priorizando lo más concreto.".into()
+        } else {
+            draft
+        };
+        project.chats[project.active_chat].draft = plan::plan_request_prompt(&goal);
+        if let Some(agent) = project.chats[project.active_chat].agent.as_mut() {
+            if agent.provider.kind.supports_cursor_modes() {
+                agent.cursor_mode = Some(AgentMode::Plan);
+            }
+        }
+        self.screen = DockScreen::Chat;
+        self.dispatch_send(ctx, ReplyKind::Plan, goal);
+    }
+
+    fn open_plan(&mut self, index: usize) {
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        if index >= project.plans.len() {
+            return;
+        }
+        project.active_plan = Some(index);
+        self.screen = DockScreen::Plan;
+    }
+
+    fn begin_develop_plan(&mut self, ctx: &egui::Context, plan_id: &str) {
+        let Some(project) = self.active() else {
+            return;
+        };
+        let Some(plan) = project.plans.iter().find(|p| p.id == plan_id).cloned() else {
+            self.notice = Some("No encontré ese plan.".into());
+            self.screen = DockScreen::Chat;
+            return;
+        };
+        if project.chats[project.active_chat].agent.is_none() {
+            self.develop_plan_id = Some(plan.id);
+            self.model_pick_from_chat = true;
+            self.picker_mode = AgentMode::Agent;
+            self.screen = DockScreen::PickProvider;
+            self.notice = Some("Elegí con qué agente desarrollar el plan.".into());
+            return;
+        }
+        let prompt = plan.develop_prompt();
+        let title = plan.title.clone();
+        let project = self.active_mut().unwrap();
+        if let Some(agent) = project.chats[project.active_chat].agent.as_mut() {
+            if agent.provider.kind.supports_cursor_modes() {
+                agent.cursor_mode = Some(AgentMode::Agent);
+            }
+        }
+        project.chats[project.active_chat].draft = prompt;
+        self.screen = DockScreen::Chat;
+        self.dispatch_send(ctx, ReplyKind::Chat, title.clone());
+        self.notice = Some(format!("Desarrollando «{title}»…"));
+    }
+
+    fn pick_agent_for_plan(&mut self, plan_id: &str) {
+        self.develop_plan_id = Some(plan_id.to_string());
+        self.plan_generate_after_pick = false;
+        self.model_pick_from_chat = true;
+        self.picker_mode = AgentMode::Agent;
+        self.screen = DockScreen::PickProvider;
     }
 
     /// Cambia el modelo solo del chat que estás viendo. El historial se queda;
@@ -1060,6 +1245,10 @@ impl YeisonDock {
     }
 
     fn send_draft(&mut self, ctx: &egui::Context) {
+        self.dispatch_send(ctx, ReplyKind::Chat, String::new());
+    }
+
+    fn dispatch_send(&mut self, ctx: &egui::Context, kind: ReplyKind, goal_hint: String) {
         let Some(project) = self.active() else {
             return;
         };
@@ -1086,12 +1275,20 @@ impl YeisonDock {
         let seq = self.reply_gen;
         let cancel = new_cancel_flag();
         let project = self.active_mut().unwrap();
+        let hint = if goal_hint.is_empty() {
+            text.clone()
+        } else {
+            goal_hint
+        };
         project.chats[index].pending = Some(PendingReply {
             seq,
             text: String::new(),
             thinking: false,
             started: Instant::now(),
             cancel: cancel.clone(),
+            work: WorkMeter::starting(),
+            kind,
+            goal_hint: hint,
         });
         let mut session = project.chats[index].session.clone();
         let tx = self.ui_tx.clone();
@@ -1107,10 +1304,43 @@ impl YeisonDock {
                 &entry.brain_dir,
                 &text,
                 &cancel,
-                |message| {
-                    let _ = tx_events.send(UiEvent::BrainProgress {
-                        brain_dir: brain_for_progress.clone(),
-                        text: message,
+                |tick| {
+                    let (label, file, brain_tokens) = match tick {
+                        ProgressTick::Status(message) => {
+                            let _ = tx_events.send(UiEvent::BrainProgress {
+                                brain_dir: brain_for_progress.clone(),
+                                text: message.clone(),
+                            });
+                            (message, None, None)
+                        }
+                        ProgressTick::File { path, detail } => {
+                            let _ = tx_events.send(UiEvent::BrainProgress {
+                                brain_dir: brain_for_progress.clone(),
+                                text: format!("{detail}: {path}"),
+                            });
+                            (detail, Some(path), None)
+                        }
+                        ProgressTick::Packed { bytes } => {
+                            let tokens = brain::estimate_tokens_bytes(bytes);
+                            let _ = tx_events.send(UiEvent::BrainProgress {
+                                brain_dir: brain_for_progress.clone(),
+                                text: format!("Context pack listo · ~{tokens} tok Brain"),
+                            });
+                            (
+                                format!("Context pack listo (~{tokens} tok del Brain)"),
+                                None,
+                                Some(tokens),
+                            )
+                        }
+                    };
+                    let _ = tx_events.send(UiEvent::WorkUpdate {
+                        seq,
+                        source: WorkSource::Brain,
+                        label,
+                        file,
+                        brain_tokens,
+                        prompt_tokens: None,
+                        output_tokens: None,
                     });
                     ctx_events.request_repaint();
                 },
@@ -1130,6 +1360,17 @@ impl YeisonDock {
                 ctx_clone.request_repaint();
                 return;
             }
+            let prompt_tokens = brain::estimate_tokens(&prompt);
+            let _ = tx.send(UiEvent::WorkUpdate {
+                seq,
+                source: WorkSource::Tokens,
+                label: "Enviando al modelo…".into(),
+                file: None,
+                brain_tokens: None,
+                prompt_tokens: Some(prompt_tokens),
+                output_tokens: Some(0),
+            });
+            ctx_clone.request_repaint();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 send_message(&selection, &mut session, &prompt, &cancel, |event| {
                     let ui_event = match event {
@@ -1192,30 +1433,85 @@ impl YeisonDock {
                 UiEvent::ReplyThinking { seq } => {
                     if let Some(pending) = self.pending_mut(seq) {
                         pending.thinking = true;
+                        pending.work.source = WorkSource::Tokens;
+                        if pending.work.label.is_empty()
+                            || pending.work.label.starts_with("Enviando")
+                        {
+                            pending.work.label = "Razonando…".into();
+                        }
                     }
                 }
                 UiEvent::ReplyDelta { seq, text } => {
                     if let Some(pending) = self.pending_mut(seq) {
                         pending.thinking = false;
                         pending.text.push_str(&text);
+                        pending.work.source = WorkSource::Tokens;
+                        pending.work.label = "Generando respuesta…".into();
+                        pending.work.file = None;
+                        pending.work.output_tokens = brain::estimate_tokens(&pending.text);
                     }
                 }
                 UiEvent::ReplyReplace { seq, text } => {
                     if let Some(pending) = self.pending_mut(seq) {
                         pending.thinking = false;
                         pending.text = text;
+                        pending.work.source = WorkSource::Tokens;
+                        pending.work.label = "Generando respuesta…".into();
+                        pending.work.file = None;
+                        pending.work.output_tokens = brain::estimate_tokens(&pending.text);
+                    }
+                }
+                UiEvent::WorkUpdate {
+                    seq,
+                    source,
+                    label,
+                    file,
+                    brain_tokens,
+                    prompt_tokens,
+                    output_tokens,
+                } => {
+                    if let Some(pending) = self.pending_mut(seq) {
+                        pending.work.source = source;
+                        pending.work.label = label;
+                        if file.is_some() {
+                            pending.work.file = file;
+                        }
+                        if let Some(value) = brain_tokens {
+                            pending.work.brain_tokens = value;
+                        }
+                        if let Some(value) = prompt_tokens {
+                            pending.work.prompt_tokens = value;
+                        }
+                        if let Some(value) = output_tokens {
+                            pending.work.output_tokens = value;
+                        }
                     }
                 }
                 UiEvent::ReplyDone { seq, text, session } => {
                     if let Some((open_idx, chat_idx)) = self.chat_loc_for_seq(seq) {
+                        let pending = self.open_projects[open_idx].chats[chat_idx].pending.take();
+                        let (kind, goal_hint) = pending
+                            .map(|p| (p.kind, p.goal_hint))
+                            .unwrap_or((ReplyKind::Chat, String::new()));
                         let chat = &mut self.open_projects[open_idx].chats[chat_idx];
-                        chat.pending = None;
                         chat.session = session;
                         chat.messages.push(ChatMessage {
                             role: MessageRole::Assistant,
-                            text,
+                            text: text.clone(),
                         });
                         self.mark_robot_done();
+                        if kind == ReplyKind::Plan {
+                            let plan = WorkPlan::from_markdown(&goal_hint, &text);
+                            let project = &mut self.open_projects[open_idx];
+                            project.plans.push(plan);
+                            let index = project.plans.len() - 1;
+                            project.active_plan = Some(index);
+                            self.active_open = open_idx;
+                            self.screen = DockScreen::Plan;
+                            self.notice = Some(
+                                "Plan listo. Elegí con qué IA o agente lo querés desarrollar.".into(),
+                            );
+                        }
                     }
                 }
                 UiEvent::ReplyFailed { seq, error } => {
@@ -2777,13 +3073,17 @@ impl YeisonDock {
                         .active()
                         .map(|p| p.active_chat + 1)
                         .unwrap_or(1);
-                    let start_label = if self.model_pick_from_chat {
+                    let start_label = if self.develop_plan_id.is_some() {
+                        "Usar para desarrollar el plan".into()
+                    } else if self.plan_generate_after_pick {
+                        "Usar para generar el plan".into()
+                    } else if self.model_pick_from_chat {
                         format!("Usar en el chat {chat_n}")
                     } else {
                         "Empezar a chatear".into()
                     };
                     if Self::primary_button(ui, &start_label, can_start, true) {
-                        self.start_chat();
+                        self.start_chat(ui.ctx());
                     }
                 });
             });
@@ -2791,6 +3091,93 @@ impl YeisonDock {
     }
 
     // ----- Pantalla: chat -----
+
+    fn show_work_card(ui: &mut egui::Ui, pending: &PendingReply, max_w: f32) {
+        let work = &pending.work;
+        let secs = pending.started.elapsed().as_secs();
+        let mood = if work.source == WorkSource::Brain {
+            robot::Mood::Syncing
+        } else if pending.thinking {
+            robot::Mood::Thinking
+        } else {
+            robot::Mood::Working
+        };
+        let badge_fill = match work.source {
+            WorkSource::Brain => palette::OK,
+            WorkSource::Tokens => palette::ACCENT,
+        };
+        let time = ui.input(|i| i.time) as f32;
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_max_width(max_w);
+            egui::Frame::new()
+                .fill(palette::CARD)
+                .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let face = ui.allocate_exact_size(egui::vec2(28.0, 26.0), egui::Sense::hover());
+                        robot::paint(ui.painter(), face.0, mood, time);
+                        ui.add(egui::Spinner::new().size(12.0).color(badge_fill));
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                egui::Frame::new()
+                                    .fill(badge_fill)
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(work.source.label())
+                                                .strong()
+                                                .size(10.0)
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                    });
+                                ui.label(
+                                    egui::RichText::new(format!("{secs} s"))
+                                        .size(10.0)
+                                        .color(palette::TEXT_MUTED),
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new(&work.label)
+                                    .size(11.0)
+                                    .color(palette::TEXT),
+                            );
+                        });
+                    });
+                    if let Some(file) = &work.file {
+                        ui.add_space(4.0);
+                        let short = short_path(file, 42);
+                        ui.label(
+                            egui::RichText::new(format!("Archivo: {short}"))
+                                .size(10.0)
+                                .color(palette::TEXT_DIM),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    let meters = match work.source {
+                        WorkSource::Brain => format!(
+                            "Brain ~{} tok · sin gasto de API todavía",
+                            work.brain_tokens
+                        ),
+                        WorkSource::Tokens => format!(
+                            "Prompt ~{} · salida ~{} · Brain ~{} tok",
+                            work.prompt_tokens, work.output_tokens, work.brain_tokens
+                        ),
+                    };
+                    ui.label(
+                        egui::RichText::new(meters)
+                            .size(9.5)
+                            .color(palette::TEXT_MUTED),
+                    );
+                });
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(80));
+    }
 
     fn chat_title(&self) -> (String, String) {
         let chat_n = self
@@ -3048,10 +3435,6 @@ impl YeisonDock {
             )
         });
         let brain_status = self.active().and_then(|p| p.brain_status.clone());
-        let brain_progress = self
-            .active()
-            .map(|p| p.brain_progress.clone())
-            .unwrap_or_default();
 
         Self::paint_panel_background(ui, self.expanded);
         let inner = self.content_rect(ui);
@@ -3081,8 +3464,19 @@ impl YeisonDock {
                         if Self::ghost_button(ui, "Nuevo") {
                             self.new_chat();
                         }
+                        if Self::ghost_button(ui, "Plan") {
+                            self.request_plan(ui.ctx());
+                        }
                         if Self::ghost_button(ui, "Modelo") {
                             self.open_model_picker();
+                        }
+                        let last_plan = self
+                            .active()
+                            .and_then(|p| p.plans.len().checked_sub(1));
+                        if let Some(index) = last_plan {
+                            if Self::ghost_button(ui, "Planes") {
+                                self.open_plan(index);
+                            }
                         }
                     });
                 });
@@ -3182,24 +3576,9 @@ impl YeisonDock {
                             ui.add_space(6.0);
                         }
                         if let Some(pending) = &slot.pending {
-                            let secs = pending.started.elapsed().as_secs();
-                            if pending.text.trim().is_empty() {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Spinner::new().size(12.0).color(palette::ACCENT));
-                                    let status = if !brain_progress.is_empty() {
-                                        brain_progress.clone()
-                                    } else if pending.thinking {
-                                        "Razonando…".into()
-                                    } else {
-                                        "Conectando…".into()
-                                    };
-                                    ui.label(
-                                        egui::RichText::new(format!("{status} {secs} s"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_MUTED),
-                                    );
-                                });
-                            } else {
+                            Self::show_work_card(ui, pending, max_bubble_w);
+                            if !pending.text.trim().is_empty() {
+                                ui.add_space(6.0);
                                 Self::bubble(
                                     ui,
                                     MessageRole::Assistant,
@@ -3277,6 +3656,245 @@ impl YeisonDock {
             });
         });
     }
+
+    fn show_plan(&mut self, ui: &mut egui::Ui) {
+        if !self.active().is_some_and(|p| !p.plans.is_empty()) {
+            self.screen = DockScreen::Chat;
+            return;
+        }
+        Self::paint_panel_background(ui, self.expanded);
+        let inner = self.content_rect(ui);
+        let providers: Vec<(String, String)> = self
+            .catalog
+            .installed_providers()
+            .map(|p| (p.id.clone(), p.display_name.clone()))
+            .collect();
+
+        let mut back = false;
+        let mut develop_id: Option<String> = None;
+        let mut pick_id: Option<String> = None;
+        let mut switch_plan: Option<usize> = None;
+        let mut toggle_step: Option<usize> = None;
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if Self::command_button(ui, Some(Mark::Back), "Chat") {
+                        back = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.expand_control(ui);
+                    });
+                });
+                Self::header(ui, "Plan de trabajo", Some("Revisá los pasos y elegí con qué IA desarrollarlo"));
+                ui.add_space(6.0);
+
+                let plan_count = self.active().map(|p| p.plans.len()).unwrap_or(0);
+                if plan_count > 1 {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let active = self.active().and_then(|p| p.active_plan).unwrap_or(0);
+                        let gap = 6.0;
+                        let gaps = gap * plan_count.saturating_sub(1) as f32;
+                        let chip_w = ((ui.available_width() - gaps) / plan_count as f32).max(40.0);
+                        for index in 0..plan_count {
+                            let label = self
+                                .active()
+                                .and_then(|p| p.plans.get(index))
+                                .map(|p| {
+                                    let mut s: String = p.title.chars().take(10).collect();
+                                    if p.title.chars().count() > 10 {
+                                        s.push('…');
+                                    }
+                                    s
+                                })
+                                .unwrap_or_else(|| format!("{}", index + 1));
+                            if Self::pill(ui, &label, active == index, chip_w) {
+                                switch_plan = Some(index);
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+
+                let plan = self.active().and_then(|p| {
+                    let idx = p.active_plan.unwrap_or(p.plans.len().saturating_sub(1));
+                    p.plans.get(idx).cloned()
+                });
+                let Some(plan) = plan else {
+                    return;
+                };
+
+                let list_h = (ui.available_height() - 150.0).max(80.0);
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        Self::card(ui, false, |ui| {
+                            ui.label(
+                                egui::RichText::new(&plan.title)
+                                    .strong()
+                                    .size(15.0)
+                                    .color(palette::TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Creado {}",
+                                    ago_label(plan.created_unix)
+                                ))
+                                .size(9.0)
+                                .color(palette::TEXT_MUTED),
+                            );
+                            if !plan.goal.trim().is_empty() {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&plan.goal)
+                                            .size(11.0)
+                                            .color(palette::TEXT_DIM),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Pasos")
+                                .strong()
+                                .size(12.0)
+                                .color(palette::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+                        if plan.steps.is_empty() {
+                            markdown::show(
+                                ui,
+                                &plan.raw_markdown,
+                                &Self::markdown_theme(MessageRole::Assistant),
+                            );
+                        } else {
+                            for (index, step) in plan.steps.iter().enumerate() {
+                                let mark = if step.done { "✓" } else { "○" };
+                                let response = Self::card(ui, false, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{mark} {}", index + 1))
+                                                .size(11.0)
+                                                .color(if step.done {
+                                                    palette::OK
+                                                } else {
+                                                    palette::ACCENT
+                                                }),
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&step.title)
+                                                    .strong()
+                                                    .size(12.0)
+                                                    .color(palette::TEXT),
+                                            );
+                                            if !step.detail.trim().is_empty() {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&step.detail)
+                                                            .size(10.0)
+                                                            .color(palette::TEXT_MUTED),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            }
+                                        });
+                                    });
+                                });
+                                if response.clicked() {
+                                    toggle_step = Some(index);
+                                }
+                                ui.add_space(4.0);
+                            }
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Desarrollar con")
+                        .strong()
+                        .size(12.0)
+                        .color(palette::TEXT_DIM),
+                );
+                ui.label(
+                    egui::RichText::new("Elegí la IA o el agente que va a ejecutar el plan.")
+                        .size(9.5)
+                        .color(palette::TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                if providers.is_empty() {
+                    if Self::primary_button(ui, "Buscar asistentes", true, true) {
+                        self.screen = DockScreen::PickProvider;
+                    }
+                } else {
+                    egui::ScrollArea::horizontal()
+                        .max_height(40.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (id, name) in &providers {
+                                    let mut short: String = name.chars().take(12).collect();
+                                    if name.chars().count() > 12 {
+                                        short.push('…');
+                                    }
+                                    if Self::ghost_button(ui, &short) {
+                                        self.selected_provider = Some(id.clone());
+                                        self.selected_model_id.clear();
+                                        pick_id = Some(plan.id.clone());
+                                    }
+                                }
+                            });
+                        });
+                    ui.add_space(4.0);
+                    if Self::primary_button(ui, "Desarrollar con el agente actual", true, true) {
+                        develop_id = Some(plan.id.clone());
+                    }
+                }
+
+                if let Some(notice) = &self.notice {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(notice).size(9.0).color(palette::TEXT_MUTED),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
+        });
+
+        if back {
+            self.screen = DockScreen::Chat;
+            self.focus_input = true;
+        }
+        if let Some(index) = switch_plan {
+            if let Some(project) = self.active_mut() {
+                project.active_plan = Some(index);
+            }
+        }
+        if let Some(index) = toggle_step {
+            if let Some(project) = self.active_mut() {
+                if let Some(plan_idx) = project.active_plan {
+                    if let Some(step) = project.plans.get_mut(plan_idx).and_then(|p| p.steps.get_mut(index))
+                    {
+                        step.done = !step.done;
+                    }
+                }
+            }
+        }
+        if let Some(plan_id) = develop_id {
+            self.begin_develop_plan(ui.ctx(), &plan_id);
+        }
+        if let Some(plan_id) = pick_id {
+            self.pick_agent_for_plan(&plan_id);
+        }
+    }
 }
 
 impl eframe::App for YeisonDock {
@@ -3348,6 +3966,7 @@ impl eframe::App for YeisonDock {
                 DockScreen::PickProvider => self.show_pick_provider(ui),
                 DockScreen::PickModel => self.show_pick_model(ui),
                 DockScreen::Chat => self.show_chat(ui),
+                DockScreen::Plan => self.show_plan(ui),
             });
 
         // Después de procesar la UI para que egui registre clics dentro del chat.

@@ -28,6 +28,24 @@ const MAX_SYMBOLS_PER_FILE: usize = 120;
 const MAX_IMPORTS_PER_FILE: usize = 80;
 const MAX_GIT_ENTRIES: usize = 2_000;
 
+/// Progreso fino del Brain mientras arma contexto (archivo + bytes del pack).
+#[derive(Clone, Debug)]
+pub enum ProgressTick {
+    Status(String),
+    File { path: String, detail: String },
+    Packed { bytes: usize },
+}
+
+/// Estimación grosera de tokens (~4 caracteres por token).
+pub fn estimate_tokens(text: &str) -> u32 {
+    let chars = text.chars().count();
+    ((chars + 3) / 4) as u32
+}
+
+pub fn estimate_tokens_bytes(bytes: usize) -> u32 {
+    ((bytes + 3) / 4) as u32
+}
+
 const SKIP_DIRS: &[&str] = &[
     ".git",
     ".hg",
@@ -816,20 +834,28 @@ pub fn sync_if_stale<F: FnMut(String)>(
 }
 
 /// Prepara el prompt final: sincroniza si hace falta y arma un context pack progresivo.
-pub fn compose_prompt_live<F: FnMut(String)>(
+pub fn compose_prompt_live<F: FnMut(ProgressTick)>(
     name: &str,
     root: &Path,
     brain_dir: &Path,
     question: &str,
     cancel: &CancelFlag,
-    progress: F,
+    mut progress: F,
 ) -> (String, Result<SyncOutcome, String>) {
     let _guard = BRAIN_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-    let mut outcome = sync_session_locked(root, brain_dir, false, cancel, progress);
+    progress(ProgressTick::Status(
+        "Brain: comprobando rama e índice…".into(),
+    ));
+    let mut outcome = sync_session_locked(root, brain_dir, false, cancel, |message| {
+        progress(ProgressTick::Status(message));
+    });
     let mut state = load_state(brain_dir);
     if !cancel.load(Ordering::Relaxed) {
         if let Some(state) = state.as_mut() {
-            settle_question(root, state, question);
+            progress(ProgressTick::Status(
+                "Brain: asentando conocimiento de la consulta…".into(),
+            ));
+            settle_question(root, state, question, &mut progress);
             let _ = save_state(brain_dir, state);
             if let Ok(kind) = outcome.as_mut() {
                 let status = match kind {
@@ -845,11 +871,28 @@ pub fn compose_prompt_live<F: FnMut(String)>(
         Ok(SyncOutcome::Updated(status, _)) => status.git.clone(),
         Err(_) => filter_git(root, brain_dir, inspect_git(root)),
     };
-    let prompt = compose_prompt_from_state(name, root, brain_dir, state.as_ref(), &live_git, question);
+    progress(ProgressTick::Status(
+        "Brain: armando el context pack…".into(),
+    ));
+    let prompt = compose_prompt_from_state(
+        name,
+        root,
+        brain_dir,
+        state.as_ref(),
+        &live_git,
+        question,
+        &mut progress,
+    );
+    progress(ProgressTick::Packed { bytes: prompt.len() });
     (prompt, outcome)
 }
 
-fn settle_question(root: &Path, state: &mut BrainState, question: &str) {
+fn settle_question<F: FnMut(ProgressTick)>(
+    root: &Path,
+    state: &mut BrainState,
+    question: &str,
+    progress: &mut F,
+) {
     let keywords = keywords(question);
     let mut ranked: Vec<(i32, String)> = state
         .files
@@ -863,11 +906,19 @@ fn settle_question(root: &Path, state: &mut BrainState, question: &str) {
     ranked.truncate(6);
     let chosen: Vec<String> = ranked.into_iter().map(|(_, rel)| rel).collect();
     for rel in &chosen {
+        progress(ProgressTick::File {
+            path: rel.clone(),
+            detail: "Enriqueciendo desde el Brain".into(),
+        });
         enrich_file(root, state, rel);
     }
     prune_stale_cards(state);
     let modules: BTreeSet<String> = chosen.iter().map(|rel| module_for(rel)).collect();
     for module in &modules {
+        progress(ProgressTick::File {
+            path: format!("modules/{module}"),
+            detail: "Asentando ficha".into(),
+        });
         write_card(state, module);
     }
     remember(state, &keywords, &chosen);
@@ -1114,13 +1165,14 @@ fn render_settled(state: &BrainState, question: &str) -> String {
     out
 }
 
-fn compose_prompt_from_state(
+fn compose_prompt_from_state<F: FnMut(ProgressTick)>(
     name: &str,
     root: &Path,
     brain_dir: &Path,
     state: Option<&BrainState>,
     live_git: &GitState,
     question: &str,
+    progress: &mut F,
 ) -> String {
     let mut pack = String::new();
     pack.push_str(&format!("PROYECTO: «{name}»\n"));
@@ -1185,17 +1237,29 @@ fn compose_prompt_from_state(
             }
             pack.push_str("- `00_overview.md` es documentación general. No sustituye al código.\n");
             pack.push('\n');
+            progress(ProgressTick::File {
+                path: "conocimiento_asentado".into(),
+                detail: "Cargando fichas del Brain".into(),
+            });
             pack.push_str(&render_settled(state, question));
 
-            let sources = load_current_sources(root, state, question);
+            let sources = load_current_sources(root, state, question, progress);
             if !sources.is_empty() {
                 pack.push_str(&sources);
                 pack.push('\n');
             }
+            progress(ProgressTick::File {
+                path: "índice".into(),
+                detail: "Recuperando archivos relevantes".into(),
+            });
             pack.push_str(&retrieve_relevant(state, question));
             pack.push('\n');
 
             if let Some(extra) = read_extra_context(brain_dir) {
+                progress(ProgressTick::File {
+                    path: "06_extra_context.md".into(),
+                    detail: "Contexto extra aportado".into(),
+                });
                 pack.push_str("CONTEXTO EXTRA APORTADO POR EL USUARIO:\n");
                 pack.push_str(&extra);
                 pack.push('\n');
@@ -1299,7 +1363,12 @@ fn question_needs_source(question: &str) -> bool {
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
-fn load_current_sources(root: &Path, state: &BrainState, question: &str) -> String {
+fn load_current_sources<F: FnMut(ProgressTick)>(
+    root: &Path,
+    state: &BrainState,
+    question: &str,
+    progress: &mut F,
+) -> String {
     if !question_needs_source(question) {
         return String::new();
     }
@@ -1365,6 +1434,10 @@ fn load_current_sources(root: &Path, state: &BrainState, question: &str) -> Stri
             if !seen.insert(rel.clone()) {
                 continue;
             }
+            progress(ProgressTick::File {
+                path: rel.clone(),
+                detail: "Leyendo código actual".into(),
+            });
             if !append_live_file(&mut out, root, &rel, &mut budget, 5 * 1024) {
                 out.push_str("\n_(se cortó la lectura para no exceder el contexto)_\n");
                 return out;
@@ -1383,6 +1456,10 @@ fn load_current_sources(root: &Path, state: &BrainState, question: &str) -> Stri
             if !seen.insert(rel.clone()) {
                 continue;
             }
+            progress(ProgressTick::File {
+                path: rel.clone(),
+                detail: format!("Dependencia `{dependency}`"),
+            });
             out.push_str(&format!("\n### Dependencia `{dependency}`\n"));
             if !append_live_file(&mut out, root, &rel, &mut budget, 2 * 1024) {
                 out.push_str("\n_(se cortó la lectura para no exceder el contexto)_\n");
@@ -3784,6 +3861,7 @@ mod tests {
     }
 
     fn quiet(_: String) {}
+    fn quiet_tick(_: ProgressTick) {}
 
     #[test]
     fn relee_si_el_blob_cambio_y_no_si_el_worktree_sigue_igual() {
@@ -3824,12 +3902,12 @@ mod tests {
         )
         .unwrap();
 
-        let (first, _) = compose_prompt_live("demo", &root, &brain, "qué hace hello", &cancel(), quiet);
+        let (first, _) = compose_prompt_live("demo", &root, &brain, "qué hace hello", &cancel(), quiet_tick);
         assert!(first.contains("CONOCIMIENTO ASENTADO"), "{first}");
         assert!(first.contains("Devuelve el saludo del proyecto"), "{first}");
         assert!(first.contains("pub fn hello() -> i32"), "{first}");
 
-        let (second, _) = compose_prompt_live("demo", &root, &brain, "hello de nuevo", &cancel(), quiet);
+        let (second, _) = compose_prompt_live("demo", &root, &brain, "hello de nuevo", &cancel(), quiet_tick);
         assert!(second.contains("visto 2 veces"), "{second}");
         assert_eq!(load_state(&brain).unwrap().recall.consultations, 2);
 
@@ -3838,7 +3916,7 @@ mod tests {
             "/// Ahora cuenta visitas.\npub fn hello() -> i32 {\n    40\n}\n\npub fn visits() -> i32 {\n    0\n}\n",
         )
         .unwrap();
-        let (third, _) = compose_prompt_live("demo", &root, &brain, "qué hace hello", &cancel(), quiet);
+        let (third, _) = compose_prompt_live("demo", &root, &brain, "qué hace hello", &cancel(), quiet_tick);
         assert!(third.contains("Ahora cuenta visitas"), "{third}");
         assert!(third.contains("fn visits"), "{third}");
         assert!(!third.contains("Devuelve el saludo del proyecto"), "{third}");
@@ -3916,7 +3994,7 @@ mod tests {
             "un worktree sucio ya indexado no se reconstruye: {again:?}"
         );
 
-        let (ask, _) = compose_prompt_live("demo", &root, &brain, "qué módulos tiene el proyecto", &cancel(), quiet);
+        let (ask, _) = compose_prompt_live("demo", &root, &brain, "qué módulos tiene el proyecto", &cancel(), quiet_tick);
         assert!(ask.contains("NIVEL 1"));
         assert!(!ask.contains("NIVEL 3"));
         let (edit_prompt, _) = compose_prompt_live(
@@ -3925,7 +4003,7 @@ mod tests {
             &brain,
             "modifica hello para que devuelva otro valor",
             &cancel(),
-            quiet,
+            quiet_tick,
         );
         assert!(edit_prompt.contains("NIVEL 3"));
         assert!(edit_prompt.contains("fn hello"));
@@ -3943,7 +4021,7 @@ mod tests {
             &brain,
             "modifica hello otra vez",
             &cancel(),
-            quiet,
+            quiet_tick,
         );
         assert!(after_revert.contains("1\n}\n"));
         assert!(!after_revert.contains("99\n"));
@@ -3995,7 +4073,7 @@ mod tests {
             other => panic!("cambiar de rama debía ser incremental: {other:?}"),
         }
         let (feature_prompt, _) =
-            compose_prompt_live("demo", &root, &brain, "modifica helper", &cancel(), quiet);
+            compose_prompt_live("demo", &root, &brain, "modifica helper", &cancel(), quiet_tick);
         assert!(feature_prompt.contains("extra_helper"));
         git(&root, &["checkout", "main"]);
         let back = sync_session(&root, &brain, false, &cancel(), quiet).unwrap();
@@ -4009,7 +4087,7 @@ mod tests {
             &brain,
             "modifica helper",
             &cancel(),
-            quiet,
+            quiet_tick,
         );
         assert!(helper_prompt.contains("fn helper"));
         assert!(helper_prompt.contains("2\n}\n"));
