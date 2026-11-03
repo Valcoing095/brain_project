@@ -7,6 +7,7 @@ mod ai;
 mod brain;
 mod cursor_agent;
 mod macos_overlay;
+mod markdown;
 mod native_picker;
 mod project;
 
@@ -23,6 +24,8 @@ use project::{ProjectEntry, ProjectRegistry};
 use readmouse::Mouse;
 
 const DOCK_WIDTH_CM: f32 = 8.5;
+/// A partir de esta cantidad la barra de pestañas se compacta.
+const MAX_VISIBLE_TABS: usize = 5;
 const DOCK_HEIGHT_CM: f32 = 11.0;
 /// Espacio entre el borde superior del monitor y el panel del dock.
 const DOCK_MARGIN_TOP_CM: f32 = 1.0;
@@ -141,6 +144,7 @@ enum MessageRole {
     User,
     Assistant,
     Error,
+    Note,
 }
 
 #[derive(Clone)]
@@ -213,6 +217,55 @@ struct PendingReply {
     cancel: CancelFlag,
 }
 
+/// Un chat vivo. Los dos slots siguen recibiendo respuestas aunque mires el otro.
+struct ChatSlot {
+    messages: Vec<ChatMessage>,
+    draft: String,
+    session: SessionState,
+    agent: Option<AgentSelection>,
+    pending: Option<PendingReply>,
+}
+
+impl ChatSlot {
+    fn empty() -> Self {
+        Self {
+            messages: Vec::new(),
+            draft: String::new(),
+            session: SessionState::Empty,
+            agent: None,
+            pending: None,
+        }
+    }
+
+    fn model_short(&self) -> String {
+        let Some(agent) = &self.agent else {
+            return "sin modelo".into();
+        };
+        let label = agent
+            .provider
+            .models
+            .iter()
+            .find(|model| model.id == agent.model_id)
+            .map(|model| model.label.as_str())
+            .unwrap_or(agent.model_id.as_str());
+        let mut short: String = label.chars().take(10).collect();
+        if label.chars().count() > 10 {
+            short.push('…');
+        }
+        short
+    }
+
+    fn tab_label(&self, index: usize, with_model: bool) -> String {
+        let busy = self.pending.is_some();
+        let mark = if busy { " ..." } else { "" };
+        if with_model {
+            format!("{}  {}{mark}", index + 1, self.model_short())
+        } else {
+            format!("{}{mark}", index + 1)
+        }
+    }
+}
+
 struct YeisonDock {
     screen: DockScreen,
     visible: bool,
@@ -244,23 +297,35 @@ struct YeisonDock {
     scan_cancel: Option<CancelFlag>,
     scan_started_at: Option<Instant>,
 
-    // Selección
+    // Selección del selector (se aplica al chat activo)
     selected_provider: Option<String>,
     selected_model_id: String,
     picker_mode: AgentMode,
     model_filter: String,
-    agent_selection: Option<AgentSelection>,
+    model_pick_from_chat: bool,
 
-    // Chat
-    messages: Vec<ChatMessage>,
-    draft: String,
+    // Chats simultáneos. Con más de cinco, la barra se compacta.
+    chats: Vec<ChatSlot>,
+    active_chat: usize,
+    tab_menu_open: bool,
+    expanded: bool,
     focus_input: bool,
-    session: SessionState,
-    pending: Option<PendingReply>,
     reply_gen: u64,
 
     ui_tx: Sender<UiEvent>,
     ui_rx: Receiver<UiEvent>,
+}
+
+#[derive(Clone, Copy)]
+enum Mark {
+    Back,
+    ChevronDown,
+    ChevronUp,
+    Plus,
+    Close,
+    Expand,
+    Collapse,
+    Refresh,
 }
 
 impl YeisonDock {
@@ -299,12 +364,12 @@ impl YeisonDock {
             selected_model_id: String::new(),
             picker_mode: AgentMode::Ask,
             model_filter: String::new(),
-            agent_selection: None,
-            messages: Vec::new(),
-            draft: String::new(),
+            model_pick_from_chat: false,
+            chats: vec![ChatSlot::empty(), ChatSlot::empty()],
+            active_chat: 0,
+            tab_menu_open: false,
+            expanded: false,
             focus_input: false,
-            session: SessionState::Empty,
-            pending: None,
             reply_gen: 0,
             ui_tx,
             ui_rx,
@@ -337,7 +402,7 @@ impl YeisonDock {
             self.notice = Some(error);
         }
         if changed {
-            self.new_chat();
+            self.clear_all_chats();
         }
         self.screen = DockScreen::PickProject;
     }
@@ -535,7 +600,15 @@ impl YeisonDock {
             ProjectAction::StartScan => self.start_brain_sync(ctx, false),
             ProjectAction::Rebuild => self.start_brain_sync(ctx, true),
             ProjectAction::StopScan => self.stop_brain_scan(),
-            ProjectAction::Continue => self.screen = DockScreen::PickProvider,
+            ProjectAction::Continue => {
+                if self.chats.iter().any(|slot| slot.agent.is_some()) {
+                    self.screen = DockScreen::Chat;
+                    self.focus_input = true;
+                } else {
+                    self.model_pick_from_chat = false;
+                    self.screen = DockScreen::PickProvider;
+                }
+            }
             ProjectAction::Change => {
                 self.active_project = None;
                 self.brain_status = None;
@@ -626,42 +699,129 @@ impl YeisonDock {
             return;
         }
 
-        let cursor_modes = provider.kind.supports_cursor_modes();
-        let same_agent = self
-            .agent_selection
-            .as_ref()
-            .is_some_and(|s| s.provider.id == provider.id && s.model_id == self.selected_model_id);
-
-        self.agent_selection = Some(AgentSelection {
+        let cursor_mode = provider
+            .kind
+            .supports_cursor_modes()
+            .then_some(self.picker_mode);
+        self.apply_agent(AgentSelection {
             provider,
             model_id: self.selected_model_id.clone(),
-            cursor_mode: cursor_modes.then_some(self.picker_mode),
+            cursor_mode,
         });
-        if !same_agent {
-            self.new_chat();
-        }
         self.screen = DockScreen::Chat;
+        self.focus_input = true;
+        self.model_pick_from_chat = false;
+    }
+
+    /// Cambia el modelo solo del chat que estás viendo. El historial se queda;
+    /// la próxima respuesta abre una sesión nueva del proveedor.
+    fn apply_agent(&mut self, selection: AgentSelection) {
+        let index = self.active_chat;
+        let same = self.chats[index].agent.as_ref().is_some_and(|current| {
+            current.provider.id == selection.provider.id
+                && current.model_id == selection.model_id
+                && current.cursor_mode == selection.cursor_mode
+        });
+        if same {
+            return;
+        }
+        if let Some(pending) = self.chats[index].pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        let had_history = !self.chats[index].messages.is_empty();
+        self.chats[index].session = SessionState::Empty;
+        let label = selection
+            .provider
+            .models
+            .iter()
+            .find(|model| model.id == selection.model_id)
+            .map(|model| model.label.clone())
+            .unwrap_or_else(|| selection.model_id.clone());
+        let provider_name = selection.provider.display_name.clone();
+        self.chats[index].agent = Some(selection);
+        if had_history {
+            self.chats[index].messages.push(ChatMessage {
+                role: MessageRole::Note,
+                text: format!("Sesión nueva con {provider_name} · {label}."),
+            });
+        }
+    }
+
+    fn open_model_picker(&mut self) {
+        if let Some(agent) = &self.chats[self.active_chat].agent {
+            self.selected_provider = Some(agent.provider.id.clone());
+            self.selected_model_id = agent.model_id.clone();
+            if let Some(mode) = agent.cursor_mode {
+                self.picker_mode = mode;
+            }
+        }
+        self.model_filter.clear();
+        self.model_pick_from_chat = true;
+        self.tab_menu_open = false;
+        self.screen = DockScreen::PickProvider;
+    }
+
+    fn add_chat(&mut self) {
+        self.chats.push(ChatSlot::empty());
+        self.active_chat = self.chats.len() - 1;
+        self.focus_input = true;
+        if self.chats.len() <= MAX_VISIBLE_TABS {
+            self.tab_menu_open = false;
+        }
+    }
+
+    fn close_chat(&mut self, index: usize) {
+        if self.chats.len() <= 1 || index >= self.chats.len() {
+            return;
+        }
+        if let Some(pending) = self.chats[index].pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.chats.remove(index);
+        if self.active_chat > index {
+            self.active_chat -= 1;
+        }
+        if self.active_chat >= self.chats.len() {
+            self.active_chat = self.chats.len() - 1;
+        }
+        if self.chats.len() <= MAX_VISIBLE_TABS {
+            self.tab_menu_open = false;
+        }
         self.focus_input = true;
     }
 
     fn new_chat(&mut self) {
         self.cancel_pending();
-        self.messages.clear();
-        self.session = SessionState::Empty;
-        self.draft.clear();
+        let slot = &mut self.chats[self.active_chat];
+        slot.messages.clear();
+        slot.session = SessionState::Empty;
+        slot.draft.clear();
         self.focus_input = true;
     }
 
+    fn clear_all_chats(&mut self) {
+        for index in 0..self.chats.len() {
+            if let Some(pending) = self.chats[index].pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.chats[index].messages.clear();
+            self.chats[index].session = SessionState::Empty;
+            self.chats[index].draft.clear();
+        }
+        self.focus_input = false;
+    }
+
     fn cancel_pending(&mut self) {
-        if let Some(pending) = self.pending.take() {
+        let slot = &mut self.chats[self.active_chat];
+        if let Some(pending) = slot.pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
             if !pending.text.trim().is_empty() {
-                self.messages.push(ChatMessage {
+                slot.messages.push(ChatMessage {
                     role: MessageRole::Assistant,
                     text: format!("{}\n\n(respuesta cancelada)", pending.text.trim_end()),
                 });
             } else {
-                self.messages.push(ChatMessage {
+                slot.messages.push(ChatMessage {
                     role: MessageRole::Error,
                     text: "Respuesta cancelada.".into(),
                 });
@@ -669,28 +829,45 @@ impl YeisonDock {
         }
     }
 
+    fn chat_index_for_seq(&self, seq: u64) -> Option<usize> {
+        self.chats.iter().position(|slot| {
+            slot.pending
+                .as_ref()
+                .is_some_and(|pending| pending.seq == seq)
+        })
+    }
+
+    fn pending_mut(&mut self, seq: u64) -> Option<&mut PendingReply> {
+        self.chats.iter_mut().find_map(|slot| {
+            slot.pending
+                .as_mut()
+                .filter(|pending| pending.seq == seq)
+        })
+    }
+
     fn send_draft(&mut self, ctx: &egui::Context) {
-        let text = self.draft.trim().to_string();
-        if text.is_empty() || self.pending.is_some() {
+        let index = self.active_chat;
+        let text = self.chats[index].draft.trim().to_string();
+        if text.is_empty() || self.chats[index].pending.is_some() {
             return;
         }
-        let Some(selection) = self.agent_selection.clone() else {
+        let Some(selection) = self.chats[index].agent.clone() else {
             return;
         };
 
         let project = self.active_project.clone();
 
-        self.messages.push(ChatMessage {
+        self.chats[index].messages.push(ChatMessage {
             role: MessageRole::User,
             text: text.clone(),
         });
-        self.draft.clear();
+        self.chats[index].draft.clear();
         self.focus_input = true;
 
         self.reply_gen += 1;
         let seq = self.reply_gen;
         let cancel = new_cancel_flag();
-        self.pending = Some(PendingReply {
+        self.chats[index].pending = Some(PendingReply {
             seq,
             text: String::new(),
             thinking: false,
@@ -698,7 +875,7 @@ impl YeisonDock {
             cancel: cancel.clone(),
         });
 
-        let mut session = self.session.clone();
+        let mut session = self.chats[index].session.clone();
         let tx = self.ui_tx.clone();
         let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
@@ -796,49 +973,54 @@ impl YeisonDock {
                     }
                 }
                 UiEvent::ReplyThinking { seq } => {
-                    if let Some(p) = self.pending.as_mut().filter(|p| p.seq == seq) {
-                        p.thinking = true;
+                    if let Some(pending) = self.pending_mut(seq) {
+                        pending.thinking = true;
                     }
                 }
                 UiEvent::ReplyDelta { seq, text } => {
-                    if let Some(p) = self.pending.as_mut().filter(|p| p.seq == seq) {
-                        p.thinking = false;
-                        p.text.push_str(&text);
+                    if let Some(pending) = self.pending_mut(seq) {
+                        pending.thinking = false;
+                        pending.text.push_str(&text);
                     }
                 }
                 UiEvent::ReplyReplace { seq, text } => {
-                    if let Some(p) = self.pending.as_mut().filter(|p| p.seq == seq) {
-                        p.thinking = false;
-                        p.text = text;
+                    if let Some(pending) = self.pending_mut(seq) {
+                        pending.thinking = false;
+                        pending.text = text;
                     }
                 }
                 UiEvent::ReplyDone { seq, text, session } => {
-                    if self.pending.as_ref().is_some_and(|p| p.seq == seq) {
-                        self.pending = None;
-                        self.session = session;
-                        self.messages.push(ChatMessage {
+                    if let Some(index) = self.chat_index_for_seq(seq) {
+                        self.chats[index].pending = None;
+                        self.chats[index].session = session;
+                        self.chats[index].messages.push(ChatMessage {
                             role: MessageRole::Assistant,
                             text,
                         });
                     }
                 }
                 UiEvent::ReplyFailed { seq, error } => {
-                    if self.pending.as_ref().is_some_and(|p| p.seq == seq) {
-                        let partial = self.pending.take().map(|p| p.text).unwrap_or_default();
-                        if error == "Cancelado." {
-                            continue;
-                        }
-                        if !partial.trim().is_empty() {
-                            self.messages.push(ChatMessage {
-                                role: MessageRole::Assistant,
-                                text: partial,
-                            });
-                        }
-                        self.messages.push(ChatMessage {
-                            role: MessageRole::Error,
-                            text: error,
+                    let Some(index) = self.chat_index_for_seq(seq) else {
+                        continue;
+                    };
+                    let partial = self.chats[index]
+                        .pending
+                        .take()
+                        .map(|pending| pending.text)
+                        .unwrap_or_default();
+                    if error == "Cancelado." {
+                        continue;
+                    }
+                    if !partial.trim().is_empty() {
+                        self.chats[index].messages.push(ChatMessage {
+                            role: MessageRole::Assistant,
+                            text: partial,
                         });
                     }
+                    self.chats[index].messages.push(ChatMessage {
+                        role: MessageRole::Error,
+                        text: error,
+                    });
                 }
                 UiEvent::BrainProgress(text) => {
                     self.brain_progress = text;
@@ -896,7 +1078,8 @@ impl YeisonDock {
             }
         }
 
-        if self.pending.is_some() || self.catalog_scanning || self.brain_scanning || self.picker_open {
+        let chat_busy = self.chats.iter().any(|slot| slot.pending.is_some());
+        if chat_busy || self.catalog_scanning || self.brain_scanning || self.picker_open {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
@@ -910,11 +1093,23 @@ impl YeisonDock {
 
     fn apply_geometry(&self, ctx: &egui::Context, display: &DisplayInfo) {
         let scale = display.scale_factor;
-        let dock = dock_rect_for_display(display);
-        let logical_size = egui::vec2(dock.w / scale, dock.h / scale);
-        let logical_pos = egui::pos2(dock.x / scale, dock.y / scale);
+        let panel = if self.expanded {
+            display_bounds(display)
+        } else {
+            dock_rect_for_display(display)
+        };
+        let logical_size = egui::vec2(panel.w / scale, panel.h / scale);
+        let logical_pos = egui::pos2(panel.x / scale, panel.y / scale);
 
+        // El tamaño inicial del viewport queda fijo al dock. Hay que soltar
+        // ese tope antes de crecer a pantalla completa, y volver a fijarlo después.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+            16_000.0, 16_000.0,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(1.0, 1.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(logical_size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(logical_size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(logical_size));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(logical_pos));
     }
 
@@ -992,16 +1187,33 @@ impl YeisonDock {
 
     // ----- Widgets reutilizables -----
 
-    fn paint_panel_background(ui: &mut egui::Ui) {
+    fn paint_panel_background(ui: &mut egui::Ui, expanded: bool) {
         let outer = ui.max_rect();
+        let radius = if expanded { 0.0 } else { 18.0 };
         let painter = ui.painter();
-        painter.rect_filled(outer, 16.0, palette::BG);
-        painter.rect_stroke(
-            outer,
-            16.0,
-            egui::Stroke::new(1.0_f32, palette::BORDER),
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_filled(outer, radius, palette::BG);
+        if !expanded {
+            painter.rect_stroke(
+                outer,
+                radius,
+                egui::Stroke::new(1.0_f32, palette::BORDER),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
+    fn content_rect(&self, ui: &egui::Ui) -> egui::Rect {
+        let margin = if self.expanded { 32.0 } else { 14.0 };
+        let outer = ui.max_rect().shrink(margin);
+        if !self.expanded {
+            return outer;
+        }
+        let max_w = 880.0;
+        if outer.width() <= max_w {
+            return outer;
+        }
+        let x = outer.center().x - max_w * 0.5;
+        egui::Rect::from_min_size(egui::pos2(x, outer.top()), egui::vec2(max_w, outer.height()))
     }
 
     fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool, full_width: bool) -> bool {
@@ -1026,13 +1238,253 @@ impl YeisonDock {
     }
 
     fn ghost_button(ui: &mut egui::Ui, label: &str) -> bool {
-        ui.add(
-            egui::Button::new(egui::RichText::new(label).size(11.5).color(palette::TEXT_DIM))
-                .fill(egui::Color32::TRANSPARENT)
-                .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
-                .corner_radius(8.0),
-        )
-        .clicked()
+        Self::command_button(ui, None, label)
+    }
+
+    fn command_button(ui: &mut egui::Ui, mark: Option<Mark>, label: &str) -> bool {
+        let font = egui::FontId::proportional(12.5);
+        let text_w = ui.ctx().fonts(|fonts| {
+            fonts
+                .layout_no_wrap(label.to_owned(), font.clone(), palette::TEXT_DIM)
+                .size()
+                .x
+        });
+        let mark_w = if mark.is_some() { 22.0 } else { 0.0 };
+        let width = text_w + mark_w + 18.0;
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 10.0, palette::CARD);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let color = if response.hovered() {
+            palette::TEXT
+        } else {
+            palette::TEXT_DIM
+        };
+        let mut text_left = rect.left() + 10.0;
+        if let Some(mark) = mark {
+            Self::paint_mark(
+                ui.painter(),
+                egui::pos2(text_left + 7.0, rect.center().y),
+                color,
+                mark,
+            );
+            text_left += mark_w;
+        }
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label.to_owned(), font, color);
+        let text_pos = egui::pos2(text_left, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(text_pos, galley, color);
+        response.clicked()
+    }
+
+    fn mark_button(ui: &mut egui::Ui, mark: Mark, active: bool) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::click());
+        let hot = response.hovered() || response.highlighted();
+        if active || hot {
+            ui.painter().rect_filled(
+                rect,
+                10.0,
+                if active {
+                    palette::ACCENT
+                } else {
+                    palette::CARD
+                },
+            );
+        }
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let color = if active {
+            egui::Color32::WHITE
+        } else if hot {
+            palette::TEXT
+        } else {
+            palette::TEXT_DIM
+        };
+        Self::paint_mark(ui.painter(), rect.center(), color, mark);
+        response
+    }
+
+    fn pill(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> bool {
+        let width = width.max(36.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+        let fill = if selected {
+            palette::ACCENT
+        } else if response.hovered() {
+            palette::CARD_SELECTED
+        } else {
+            palette::CARD
+        };
+        let color = if selected {
+            egui::Color32::WHITE
+        } else {
+            palette::TEXT
+        };
+        ui.painter().rect_filled(rect, 10.0, fill);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let text_rect = rect.shrink2(egui::vec2(10.0, 4.0));
+        let galley = ui.painter().layout(
+            label.to_owned(),
+            egui::FontId::proportional(12.0),
+            color,
+            text_rect.width(),
+        );
+        let pos = egui::pos2(
+            text_rect.left(),
+            rect.center().y - galley.size().y.min(text_rect.height()) * 0.5,
+        );
+        ui.painter()
+            .with_clip_rect(text_rect)
+            .galley(pos, galley, color);
+        response.clicked()
+    }
+
+    fn window_chip(ui: &mut egui::Ui, label: &str, open: bool, width: f32) -> bool {
+        let width = width.max(80.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+        let fill = if open || response.hovered() {
+            palette::CARD_SELECTED
+        } else {
+            palette::CARD
+        };
+        ui.painter().rect_filled(rect, 10.0, fill);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let text_rect = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(12.0, 4.0),
+            rect.right_bottom() - egui::vec2(28.0, 4.0),
+        );
+        let galley = ui.painter().layout(
+            label.to_owned(),
+            egui::FontId::proportional(12.5),
+            palette::TEXT,
+            text_rect.width().max(8.0),
+        );
+        let pos = egui::pos2(
+            text_rect.left(),
+            rect.center().y - galley.size().y.min(text_rect.height()) * 0.5,
+        );
+        ui.painter()
+            .with_clip_rect(text_rect)
+            .galley(pos, galley, palette::TEXT);
+        Self::paint_mark(
+            ui.painter(),
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            palette::TEXT,
+            if open {
+                Mark::ChevronUp
+            } else {
+                Mark::ChevronDown
+            },
+        );
+        response.clicked()
+    }
+
+    fn paint_mark(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32, mark: Mark) {
+        let stroke = egui::Stroke::new(1.7_f32, color);
+        let arm = 5.2;
+        match mark {
+            Mark::Back => {
+                let tip = center + egui::vec2(-arm * 0.15, 0.0);
+                painter.line_segment([tip, center + egui::vec2(arm * 0.9, 0.0)], stroke);
+                painter.line_segment([tip, tip + egui::vec2(arm * 0.7, -arm * 0.62)], stroke);
+                painter.line_segment([tip, tip + egui::vec2(arm * 0.7, arm * 0.62)], stroke);
+            }
+            Mark::ChevronDown => {
+                let tip = center + egui::vec2(0.0, arm * 0.38);
+                painter.line_segment([center + egui::vec2(-arm, -arm * 0.28), tip], stroke);
+                painter.line_segment([center + egui::vec2(arm, -arm * 0.28), tip], stroke);
+            }
+            Mark::ChevronUp => {
+                let tip = center + egui::vec2(0.0, -arm * 0.38);
+                painter.line_segment([center + egui::vec2(-arm, arm * 0.28), tip], stroke);
+                painter.line_segment([center + egui::vec2(arm, arm * 0.28), tip], stroke);
+            }
+            Mark::Plus => {
+                painter.line_segment(
+                    [center + egui::vec2(-arm, 0.0), center + egui::vec2(arm, 0.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [center + egui::vec2(0.0, -arm), center + egui::vec2(0.0, arm)],
+                    stroke,
+                );
+            }
+            Mark::Close => {
+                let d = arm * 0.72;
+                painter.line_segment(
+                    [center + egui::vec2(-d, -d), center + egui::vec2(d, d)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [center + egui::vec2(d, -d), center + egui::vec2(-d, d)],
+                    stroke,
+                );
+            }
+            Mark::Expand => {
+                let out = arm + 1.4;
+                let len = 4.2;
+                for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let origin = center + egui::vec2(sx * out, sy * out);
+                    painter.line_segment([origin, origin + egui::vec2(-sx * len, 0.0)], stroke);
+                    painter.line_segment([origin, origin + egui::vec2(0.0, -sy * len)], stroke);
+                }
+            }
+            Mark::Collapse => {
+                let inset = 2.4;
+                let len = 4.2;
+                for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let origin = center + egui::vec2(sx * inset, sy * inset);
+                    painter.line_segment([origin, origin + egui::vec2(sx * len, 0.0)], stroke);
+                    painter.line_segment([origin, origin + egui::vec2(0.0, sy * len)], stroke);
+                }
+            }
+            Mark::Refresh => {
+                let radius = 5.4;
+                let start = 0.55_f32;
+                let sweep = std::f32::consts::TAU - 1.15;
+                let steps = 18;
+                let mut points = Vec::with_capacity(steps + 1);
+                for step in 0..=steps {
+                    let t = start + sweep * (step as f32 / steps as f32);
+                    points.push(center + egui::vec2(t.cos(), t.sin()) * radius);
+                }
+                painter.add(egui::Shape::line(points.clone(), stroke));
+                let end = *points.last().unwrap_or(&center);
+                let dir = egui::vec2(end.x - center.x, end.y - center.y).normalized();
+                let tangent = egui::vec2(-dir.y, dir.x);
+                painter.line_segment([end, end - tangent * 4.4 + dir * 2.6], stroke);
+                painter.line_segment([end, end - tangent * 4.4 - dir * 2.6], stroke);
+            }
+        }
+    }
+
+    fn expand_control(&mut self, ui: &mut egui::Ui) {
+        let mark = if self.expanded {
+            Mark::Collapse
+        } else {
+            Mark::Expand
+        };
+        let tip = if self.expanded {
+            "Volver al dock"
+        } else {
+            "Pantalla completa"
+        };
+        if Self::mark_button(ui, mark, false)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            self.expanded = !self.expanded;
+        }
     }
 
     fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
@@ -1184,13 +1636,20 @@ impl YeisonDock {
     // ----- Pantalla: proyecto -----
 
     fn show_pick_project(&mut self, ui: &mut egui::Ui) {
-        Self::paint_panel_background(ui);
-        let inner = ui.max_rect().shrink(14.0);
+        Self::paint_panel_background(ui, self.expanded);
+        let inner = self.content_rect(ui);
         let action = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
                 ui.vertical(|ui| {
                     let mut action: Option<ProjectAction> = None;
-                    Self::header(ui, "Yeison", Some("Proyecto de trabajo"));
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            Self::header(ui, "Yeison", Some("Proyecto de trabajo"));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            self.expand_control(ui);
+                        });
+                    });
                     ui.add_space(8.0);
 
                     if let Some(draft) = &mut self.new_project {
@@ -1316,7 +1775,12 @@ impl YeisonDock {
                                 action = Some(ProjectAction::Rebuild);
                             }
                             ui.add_space(6.0);
-                            if Self::primary_button(ui, "Elegir IA y chatear", true, true) {
+                            let open_label = if self.chats.iter().any(|slot| slot.agent.is_some()) {
+                                "Abrir chats"
+                            } else {
+                                "Elegir IA y chatear"
+                            };
+                            if Self::primary_button(ui, open_label, true, true) {
                                 action = Some(ProjectAction::Continue);
                             }
                             ui.add_space(4.0);
@@ -1441,14 +1905,34 @@ impl YeisonDock {
             self.screen = DockScreen::PickProject;
             return;
         }
-        Self::paint_panel_background(ui);
-        let inner = ui.max_rect().shrink(14.0);
+        Self::paint_panel_background(ui, self.expanded);
+        let inner = self.content_rect(ui);
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.vertical(|ui| {
-                if Self::ghost_button(ui, "‹ Proyecto") {
-                    self.screen = DockScreen::PickProject;
-                }
-                Self::header(ui, "Yeison", Some("Elige con qué asistente quieres hablar"));
+                let back = if self.model_pick_from_chat {
+                    "Chat"
+                } else {
+                    "Proyecto"
+                };
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if Self::command_button(ui, Some(Mark::Back), back) {
+                        self.screen = if self.model_pick_from_chat {
+                            DockScreen::Chat
+                        } else {
+                            DockScreen::PickProject
+                        };
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.expand_control(ui);
+                    });
+                });
+                let hint = if self.model_pick_from_chat {
+                    format!("Modelo del chat {}", self.active_chat + 1)
+                } else {
+                    "Elige con qué asistente quieres hablar".into()
+                };
+                Self::header(ui, "Yeison", Some(&hint));
                 ui.add_space(10.0);
 
                 let providers: Vec<ProviderEntry> =
@@ -1537,7 +2021,8 @@ impl YeisonDock {
                                 .color(palette::TEXT_DIM),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !self.catalog_scanning && Self::ghost_button(ui, "↻ Buscar de nuevo")
+                            if !self.catalog_scanning
+                                && Self::command_button(ui, Some(Mark::Refresh), "Buscar de nuevo")
                             {
                                 self.start_scan();
                             }
@@ -1627,8 +2112,8 @@ impl YeisonDock {
     // ----- Pantalla: modelo -----
 
     fn show_pick_model(&mut self, ui: &mut egui::Ui) {
-        Self::paint_panel_background(ui);
-        let inner = ui.max_rect().shrink(14.0);
+        Self::paint_panel_background(ui, self.expanded);
+        let inner = self.content_rect(ui);
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
             let Some(provider_id) = self.selected_provider.clone() else {
                 self.screen = DockScreen::PickProvider;
@@ -1641,9 +2126,13 @@ impl YeisonDock {
 
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    if Self::ghost_button(ui, "‹ Asistentes") {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if Self::command_button(ui, Some(Mark::Back), "Asistentes") {
                         self.screen = DockScreen::PickProvider;
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.expand_control(ui);
+                    });
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -1804,7 +2293,12 @@ impl YeisonDock {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     let can_start = !self.selected_model_id.is_empty();
-                    if Self::primary_button(ui, "Empezar a chatear", can_start, true) {
+                    let start_label = if self.model_pick_from_chat {
+                        format!("Usar en el chat {}", self.active_chat + 1)
+                    } else {
+                        "Empezar a chatear".into()
+                    };
+                    if Self::primary_button(ui, &start_label, can_start, true) {
                         self.start_chat();
                     }
                 });
@@ -1815,35 +2309,75 @@ impl YeisonDock {
     // ----- Pantalla: chat -----
 
     fn chat_title(&self) -> (String, String) {
-        match &self.agent_selection {
-            Some(s) => {
-                let model_label = s
-                    .provider
-                    .models
-                    .iter()
-                    .find(|m| m.id == s.model_id)
-                    .map(|m| m.label.clone())
-                    .unwrap_or_else(|| s.model_id.clone());
-                let sub = match s.cursor_mode {
-                    Some(mode) => format!("{} · {}", mode.title(), model_label),
-                    None => model_label,
-                };
-                (s.provider.display_name.clone(), sub)
-            }
-            None => ("Chat".into(), String::new()),
+        let Some(agent) = self
+            .chats
+            .get(self.active_chat)
+            .and_then(|slot| slot.agent.as_ref())
+        else {
+            return (
+                format!("Chat {}", self.active_chat + 1),
+                "Elegí un modelo".into(),
+            );
+        };
+        let model_label = agent
+            .provider
+            .models
+            .iter()
+            .find(|model| model.id == agent.model_id)
+            .map(|model| model.label.clone())
+            .unwrap_or_else(|| agent.model_id.clone());
+        let sub = match agent.cursor_mode {
+            Some(mode) => format!("{} · {}", mode.title(), model_label),
+            None => model_label,
+        };
+        (agent.provider.display_name.clone(), sub)
+    }
+
+    fn markdown_theme(role: MessageRole) -> markdown::Theme {
+        match role {
+            MessageRole::User => markdown::Theme {
+                text: egui::Color32::WHITE,
+                muted: egui::Color32::from_rgba_premultiplied(255, 255, 255, 190),
+                accent: egui::Color32::WHITE,
+                code_bg: egui::Color32::from_rgba_premultiplied(0, 0, 0, 55),
+                quote: egui::Color32::WHITE,
+                body: 13.0,
+            },
+            MessageRole::Assistant => markdown::Theme {
+                text: palette::TEXT,
+                muted: palette::TEXT_MUTED,
+                accent: palette::ACCENT,
+                code_bg: egui::Color32::from_rgb(24, 25, 32),
+                quote: palette::ACCENT,
+                body: 13.0,
+            },
+            MessageRole::Error => markdown::Theme {
+                text: egui::Color32::from_rgb(255, 180, 188),
+                muted: egui::Color32::from_rgb(214, 140, 150),
+                accent: egui::Color32::from_rgb(255, 210, 214),
+                code_bg: egui::Color32::from_rgb(48, 24, 30),
+                quote: egui::Color32::from_rgb(255, 180, 188),
+                body: 13.0,
+            },
+            MessageRole::Note => markdown::Theme {
+                text: palette::TEXT_MUTED,
+                muted: palette::TEXT_MUTED,
+                accent: palette::TEXT_DIM,
+                code_bg: palette::CARD,
+                quote: palette::TEXT_MUTED,
+                body: 11.0,
+            },
         }
     }
 
-    fn bubble(ui: &mut egui::Ui, role: MessageRole, text: &str, max_w: f32) {
-        let (fill, color, align) = match role {
-            MessageRole::User => (palette::ACCENT, egui::Color32::WHITE, egui::Align::Max),
-            MessageRole::Assistant => (palette::CARD, palette::TEXT, egui::Align::Min),
-            MessageRole::Error => (
-                egui::Color32::from_rgb(70, 38, 44),
-                egui::Color32::from_rgb(255, 180, 188),
-                egui::Align::Min,
-            ),
+    fn bubble(ui: &mut egui::Ui, role: MessageRole, text: &str, max_w: f32, streaming: bool) {
+        let (fill, align) = match role {
+            MessageRole::User => (palette::ACCENT, egui::Align::Max),
+            MessageRole::Assistant => (palette::CARD, egui::Align::Min),
+            MessageRole::Error => (egui::Color32::from_rgb(70, 38, 44), egui::Align::Min),
+            MessageRole::Note => (egui::Color32::TRANSPARENT, egui::Align::Center),
         };
+        let theme = Self::markdown_theme(role);
         ui.with_layout(egui::Layout::top_down(align), |ui| {
             ui.set_max_width(max_w);
             egui::Frame::new()
@@ -1851,31 +2385,138 @@ impl YeisonDock {
                 .corner_radius(12.0)
                 .inner_margin(egui::Margin::symmetric(11, 8))
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text).size(13.0).color(color)).wrap(),
-                    );
+                    ui.set_width(ui.available_width());
+                    if streaming {
+                        let with_cursor = format!("{text}|");
+                        markdown::show(ui, &with_cursor, &theme);
+                    } else {
+                        markdown::show(ui, text, &theme);
+                    }
                 });
         });
     }
 
+    fn show_window_bar(&mut self, ui: &mut egui::Ui) {
+        if self.chats.is_empty() {
+            self.chats.push(ChatSlot::empty());
+            self.active_chat = 0;
+        }
+        if self.active_chat >= self.chats.len() {
+            self.active_chat = self.chats.len() - 1;
+        }
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if Self::mark_button(ui, Mark::Back, false)
+                .on_hover_text("Volver al proyecto")
+                .clicked()
+            {
+                self.tab_menu_open = false;
+                self.screen = DockScreen::PickProject;
+            }
+
+            let tools = 34.0 * 2.0 + 8.0;
+            let tabs_w = (ui.available_width() - tools).max(48.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(tabs_w, 34.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if self.chats.len() > MAX_VISIBLE_TABS {
+                        let index = self.active_chat;
+                        let label = self.chats[index].tab_label(index, true);
+                        if Self::window_chip(ui, &label, self.tab_menu_open, ui.available_width())
+                        {
+                            self.tab_menu_open = !self.tab_menu_open;
+                        }
+                    } else {
+                        self.tab_menu_open = false;
+                        let count = self.chats.len();
+                        let gap = 6.0;
+                        let gaps = gap * count.saturating_sub(1) as f32;
+                        let tab_w = ((ui.available_width() - gaps) / count as f32).max(36.0);
+                        let with_model = tab_w >= 112.0;
+                        for index in 0..count {
+                            let label = self.chats[index].tab_label(index, with_model);
+                            if Self::pill(ui, &label, self.active_chat == index, tab_w) {
+                                self.active_chat = index;
+                                self.focus_input = true;
+                            }
+                        }
+                    }
+                },
+            );
+
+            if Self::mark_button(ui, Mark::Plus, false)
+                .on_hover_text("Nueva ventana")
+                .clicked()
+            {
+                self.add_chat();
+            }
+            self.expand_control(ui);
+        });
+
+        if self.tab_menu_open && self.chats.len() > MAX_VISIBLE_TABS {
+            self.show_tab_menu(ui);
+        }
+    }
+
+    fn show_tab_menu(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        let mut close_at = None;
+        let menu_h = if self.expanded { 320.0 } else { 168.0 };
+        egui::Frame::new()
+            .fill(palette::CARD)
+            .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::symmetric(8, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .max_height(menu_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        let count = self.chats.len();
+                        for index in 0..count {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let label = self.chats[index].tab_label(index, true);
+                                let row_w = (ui.available_width() - 40.0).max(48.0);
+                                if Self::pill(ui, &label, self.active_chat == index, row_w) {
+                                    self.active_chat = index;
+                                    self.tab_menu_open = false;
+                                    self.focus_input = true;
+                                }
+                                if Self::mark_button(ui, Mark::Close, false)
+                                    .on_hover_text("Cerrar ventana")
+                                    .clicked()
+                                {
+                                    close_at = Some(index);
+                                }
+                            });
+                        }
+                    });
+            });
+        if let Some(index) = close_at {
+            self.close_chat(index);
+        }
+    }
+
     fn show_chat(&mut self, ui: &mut egui::Ui) {
         let project_name = self.active_project.as_ref().map(|p| p.name.clone());
-        Self::paint_panel_background(ui);
-        let inner = ui.max_rect().shrink(14.0);
+        Self::paint_panel_background(ui, self.expanded);
+        let inner = self.content_rect(ui);
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.vertical(|ui| {
-                // Cabecera
+                self.show_window_bar(ui);
                 let (title, subtitle) = self.chat_title();
                 ui.horizontal(|ui| {
-                    if Self::ghost_button(ui, "‹") {
-                        self.screen = DockScreen::PickModel;
-                    }
-                    ui.add_space(2.0);
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new(title)
                                 .strong()
-                                .size(14.0)
+                                .size(13.0)
                                 .color(palette::TEXT),
                         );
                         ui.add(
@@ -1888,8 +2529,12 @@ impl YeisonDock {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if Self::ghost_button(ui, "Nuevo chat") {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if Self::ghost_button(ui, "Nuevo") {
                             self.new_chat();
+                        }
+                        if Self::ghost_button(ui, "Modelo") {
+                            self.open_model_picker();
                         }
                     });
                 });
@@ -1917,6 +2562,8 @@ impl YeisonDock {
                     );
                 }
                 ui.add_space(8.0);
+                let chat = self.active_chat;
+                let has_model = self.chats[chat].agent.is_some();
                 let input_h = 46.0;
                 let messages_h = (ui.available_height() - input_h).max(60.0);
                 let max_bubble_w = ui.available_width() * 0.88;
@@ -1927,27 +2574,46 @@ impl YeisonDock {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.messages.is_empty() && self.pending.is_none() {
+                        if self.chats[chat].messages.is_empty() && self.chats[chat].pending.is_none()
+                        {
                             ui.add_space(messages_h * 0.3);
                             ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new("¿En qué te ayudo?")
-                                        .size(15.0)
-                                        .strong()
-                                        .color(palette::TEXT_DIM),
-                                );
-                                ui.label(
-                                    egui::RichText::new("Escribe abajo y pulsa Enter.")
-                                        .size(11.0)
-                                        .color(palette::TEXT_MUTED),
-                                );
+                                if has_model {
+                                    ui.label(
+                                        egui::RichText::new("¿En qué te ayudo?")
+                                            .size(15.0)
+                                            .strong()
+                                            .color(palette::TEXT_DIM),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Escribí abajo y pulsá Enter.")
+                                            .size(11.0)
+                                            .color(palette::TEXT_MUTED),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("Este chat no tiene modelo")
+                                            .size(15.0)
+                                            .strong()
+                                            .color(palette::TEXT_DIM),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Elegí uno para empezar.")
+                                            .size(11.0)
+                                            .color(palette::TEXT_MUTED),
+                                    );
+                                }
                             });
                         }
-                        for message in &self.messages {
-                            Self::bubble(ui, message.role, &message.text, max_bubble_w);
+                        for message in &self.chats[chat].messages {
+                            if message.role == MessageRole::Note {
+                                markdown::show(ui, &message.text, &Self::markdown_theme(message.role));
+                            } else {
+                                Self::bubble(ui, message.role, &message.text, max_bubble_w, false);
+                            }
                             ui.add_space(6.0);
                         }
-                        if let Some(pending) = &self.pending {
+                        if let Some(pending) = &self.chats[chat].pending {
                             let secs = pending.started.elapsed().as_secs();
                             if pending.text.trim().is_empty() {
                                 ui.horizontal(|ui| {
@@ -1969,47 +2635,56 @@ impl YeisonDock {
                                 Self::bubble(
                                     ui,
                                     MessageRole::Assistant,
-                                    &format!("{}▍", pending.text),
+                                    &pending.text,
                                     max_bubble_w,
+                                    true,
                                 );
                             }
                             ui.add_space(6.0);
                         }
                     });
 
-                // Entrada
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.horizontal(|ui| {
-                        let busy = self.pending.is_some();
-                        let button_w = 76.0;
-                        let text_edit = egui::TextEdit::singleline(&mut self.draft)
-                            .hint_text(if busy {
-                                "Esperando respuesta…"
-                            } else {
-                                "Escribe un mensaje…"
-                            })
-                            .margin(egui::vec2(10.0, 8.0))
-                            .desired_width(ui.available_width() - button_w - 8.0);
-                        let response = ui.add_enabled(!busy, text_edit);
-                        if self.focus_input && !busy {
-                            response.request_focus();
-                            self.focus_input = false;
-                        }
-                        let enter = response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if !has_model {
+                        ui.vertical_centered(|ui| {
+                            if Self::primary_button(ui, "Elegir modelo", true, true) {
+                                self.open_model_picker();
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            let busy = self.chats[chat].pending.is_some();
+                            let button_w = 76.0;
+                            let text_edit = egui::TextEdit::singleline(&mut self.chats[chat].draft)
+                                .hint_text(if busy {
+                                    "Esperando respuesta…"
+                                } else {
+                                    "Escribí un mensaje…"
+                                })
+                                .margin(egui::vec2(10.0, 8.0))
+                                .desired_width(ui.available_width() - button_w - 8.0);
+                            let response = ui.add_enabled(!busy, text_edit);
+                            if self.focus_input && !busy {
+                                response.request_focus();
+                                self.focus_input = false;
+                            }
+                            let enter = response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                        if busy {
-                            if Self::danger_button(ui, "Cancelar") {
-                                self.cancel_pending();
+                            if busy {
+                                if Self::danger_button(ui, "Cancelar") {
+                                    self.cancel_pending();
+                                }
+                            } else {
+                                let can_send = !self.chats[chat].draft.trim().is_empty();
+                                if Self::primary_button(ui, "Enviar", can_send, false)
+                                    || (enter && can_send)
+                                {
+                                    self.send_draft(ui.ctx());
+                                }
                             }
-                        } else {
-                            let can_send = !self.draft.trim().is_empty();
-                            if Self::primary_button(ui, "Enviar", can_send, false) || (enter && can_send)
-                            {
-                                self.send_draft(ui.ctx());
-                            }
-                        }
-                    });
+                        });
+                    }
                 });
             });
         });
@@ -2119,6 +2794,23 @@ fn format_sync_report(report: &BrainReport) -> String {
     }
 }
 
+fn install_markdown_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let bold_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf";
+    let mut family = vec!["Ubuntu-Light".to_owned(), "NotoEmoji-Regular".to_owned()];
+    if let Ok(bytes) = std::fs::read(bold_path) {
+        fonts.font_data.insert(
+            "YeisonBold".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        family.insert(0, "YeisonBold".to_owned());
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("YeisonBold".into()), family);
+    ctx.set_fonts(fonts);
+}
+
 fn main() -> eframe::Result<()> {
     let workspace = std::env::var("CURSOR_WORKSPACE")
         .map(std::path::PathBuf::from)
@@ -2154,6 +2846,7 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(44, 45, 55);
             visuals.selection.bg_fill = egui::Color32::from_rgb(96, 118, 255);
             cc.egui_ctx.set_visuals(visuals);
+            install_markdown_fonts(&cc.egui_ctx);
             Ok(Box::new(YeisonDock::new()))
         }),
     )
