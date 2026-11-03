@@ -8,8 +8,8 @@ El paquete de Cargo se llama `hola_mundo`.
 
 - **Isla del notch.** Mientras Yeison está abierto, un robot pequeño queda debajo del notch. Un clic abre el chat. El robot cambia de estado: espera, escaneando, pensando, trabajando, sincronizando, alerta, error y listo.
 - **Dock.** Un panel de unos 8,5 × 11 cm. Pasa el cursor por la franja superior de la pantalla para abrirlo. Un clic afuera lo cierra. Puede ocupar toda la pantalla; el contenido queda centrado.
-- **Proyectos.** Eliges la carpeta del repositorio y, si quieres, otra carpeta para el Brain.
-- **Chats.** Varias conversaciones a la vez, cada una con su modelo. Hasta cinco se ven como pestañas. A partir de la sexta, una flecha abre la lista. Las respuestas siguen llegando aunque estés en otra pestaña.
+- **Proyectos.** Eliges la carpeta del repositorio y, si quieres, otra carpeta para el Brain. Puedes tener **dos proyectos abiertos a la vez**, cada uno con su Brain y sus chats. Un botón **Transferir contexto** copia documentos precargados del Brain de uno al `context/` del otro, sin llamar a la IA ni gastar tokens.
+- **Chats.** Varias conversaciones a la vez por proyecto, cada una con su modelo. Hasta cinco se ven como pestañas. A partir de la sexta, una flecha abre la lista. Las respuestas siguen llegando aunque estés en otra pestaña o en el otro proyecto.
 - **Markdown.** Las respuestas se muestran con títulos, listas, código, citas, tablas y tareas.
 - **Brain.** Índice incremental del código, sincronizado con Git. Al empezar una sesión revisa la rama y el último escaneo. Si hubo cambios, actualiza solo lo que cambió. El overview es documentación general. El código en disco manda sobre cualquier descripción guardada.
 
@@ -46,7 +46,7 @@ Pruebas:
 cargo test --bin hola_mundo
 ```
 
-Al abrirlo, elige o crea un proyecto, espera el escaneo de las IA instaladas y entra al chat. Cambiar de modelo vale solo para la conversación activa. Cambiar de proyecto vacía los textos y conserva los modelos elegidos.
+Al abrirlo, elige o crea un proyecto, espera el escaneo de las IA instaladas y entra al chat. Cambiar de modelo vale solo para la conversación activa. Podés abrir un segundo proyecto sin cerrar el primero; cada uno conserva sus chats. Con dos abiertos, **Transferir contexto** pasa overview, índice, mapa y fichas asentadas al Brain activo como archivos locales.
 
 ## Dónde guarda datos
 

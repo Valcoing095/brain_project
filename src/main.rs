@@ -27,6 +27,8 @@ use readmouse::Mouse;
 const DOCK_WIDTH_CM: f32 = 8.5;
 /// A partir de esta cantidad la barra de pestañas se compacta.
 const MAX_VISIBLE_TABS: usize = 5;
+/// Dos proyectos vivos a la vez: cada uno con su Brain y sus chats.
+const MAX_OPEN_PROJECTS: usize = 2;
 const DOCK_HEIGHT_CM: f32 = 11.0;
 /// Espacio entre el borde superior del monitor y el panel del dock.
 /// Deja sitio para la isla del robot, justo debajo del notch.
@@ -194,7 +196,15 @@ enum ProjectAction {
     Rebuild,
     StopScan,
     Continue,
+    /// Cierra el activo y muestra la lista (el otro slot, si hay, se queda).
     Change,
+    Focus(usize),
+    /// Libera el slot activo sin tocar el otro.
+    CloseActive,
+    /// Abre el selector para llenar el segundo slot.
+    OpenSecond,
+    /// Copia el Brain del otro slot al activo (local, sin tokens).
+    TransferContext,
 }
 
 enum UiEvent {
@@ -206,7 +216,10 @@ enum UiEvent {
     ReplyReplace { seq: u64, text: String },
     ReplyDone { seq: u64, text: String, session: SessionState },
     ReplyFailed { seq: u64, error: String },
-    BrainProgress(String),
+    BrainProgress {
+        brain_dir: PathBuf,
+        text: String,
+    },
     BrainSynced {
         brain_dir: PathBuf,
         result: Result<SyncOutcome, String>,
@@ -275,6 +288,37 @@ impl ChatSlot {
     }
 }
 
+/// Un proyecto vivo: Brain propio y chats propios.
+struct OpenProject {
+    entry: ProjectEntry,
+    brain_status: Option<brain::BrainStatus>,
+    brain_scanning: bool,
+    brain_progress: String,
+    brain_cancel: Option<CancelFlag>,
+    brain_scan_target: Option<PathBuf>,
+    session_sync_pending: bool,
+    chats: Vec<ChatSlot>,
+    active_chat: usize,
+    tab_menu_open: bool,
+}
+
+impl OpenProject {
+    fn new(entry: ProjectEntry) -> Self {
+        Self {
+            entry,
+            brain_status: None,
+            brain_scanning: false,
+            brain_progress: "Comprobando rama y último índice…".into(),
+            brain_cancel: None,
+            brain_scan_target: None,
+            session_sync_pending: true,
+            chats: vec![ChatSlot::empty(), ChatSlot::empty()],
+            active_chat: 0,
+            tab_menu_open: false,
+        }
+    }
+}
+
 struct YeisonDock {
     screen: DockScreen,
     visible: bool,
@@ -284,20 +328,17 @@ struct YeisonDock {
     outside_click_enabled_after: Option<Instant>,
     overlay_configured: bool,
 
-    // Proyecto / brain
+    // Proyectos abiertos (máx. 2) + registro persistente
     projects: ProjectRegistry,
-    active_project: Option<ProjectEntry>,
+    open_projects: Vec<OpenProject>,
+    active_open: usize,
+    /// true mientras se elige el segundo proyecto desde la lista.
+    picking_second: bool,
     new_project: Option<NewProjectDraft>,
     pending_picker: Option<PickKind>,
     picker_open: bool,
     reopen_after_picker: bool,
     notice: Option<String>,
-    brain_scanning: bool,
-    brain_progress: String,
-    brain_cancel: Option<CancelFlag>,
-    brain_scan_target: Option<PathBuf>,
-    brain_status: Option<brain::BrainStatus>,
-    session_sync_pending: bool,
     robot_done_until: Option<Instant>,
     robot_error_until: Option<Instant>,
 
@@ -315,10 +356,6 @@ struct YeisonDock {
     model_filter: String,
     model_pick_from_chat: bool,
 
-    // Chats simultáneos. Con más de cinco, la barra se compacta.
-    chats: Vec<ChatSlot>,
-    active_chat: usize,
-    tab_menu_open: bool,
     expanded: bool,
     focus_input: bool,
     reply_gen: u64,
@@ -344,7 +381,7 @@ impl YeisonDock {
         let (ui_tx, ui_rx) = mpsc::channel();
         let catalog = load_catalog_cache().unwrap_or_else(AiCatalog::empty);
         let projects = ProjectRegistry::load();
-        let active_project = projects.most_recent();
+        let recent = projects.most_recent();
         let mut app = Self {
             screen: DockScreen::PickProject,
             visible: false,
@@ -354,18 +391,14 @@ impl YeisonDock {
             outside_click_enabled_after: None,
             overlay_configured: false,
             projects,
-            active_project: None,
+            open_projects: Vec::new(),
+            active_open: 0,
+            picking_second: false,
             new_project: None,
             pending_picker: None,
             picker_open: false,
             reopen_after_picker: false,
             notice: None,
-            brain_scanning: false,
-            brain_progress: String::new(),
-            brain_cancel: None,
-            brain_scan_target: None,
-            brain_status: None,
-            session_sync_pending: false,
             robot_done_until: None,
             robot_error_until: None,
             catalog,
@@ -378,46 +411,150 @@ impl YeisonDock {
             picker_mode: AgentMode::Ask,
             model_filter: String::new(),
             model_pick_from_chat: false,
-            chats: vec![ChatSlot::empty(), ChatSlot::empty()],
-            active_chat: 0,
-            tab_menu_open: false,
             expanded: false,
             focus_input: false,
             reply_gen: 0,
             ui_tx,
             ui_rx,
         };
-        if let Some(project) = active_project {
-            app.activate_project(project, false);
+        if let Some(project) = recent {
+            app.open_or_focus_project(project, false);
         }
         app
     }
 
     // ----- Proyecto / brain -----
 
-    fn activate_project(&mut self, entry: ProjectEntry, touch: bool) {
-        let changed = self
-            .active_project
-            .as_ref()
-            .map(|p| p.id != entry.id)
-            .unwrap_or(true);
+    fn active(&self) -> Option<&OpenProject> {
+        self.open_projects.get(self.active_open)
+    }
+
+    fn active_mut(&mut self) -> Option<&mut OpenProject> {
+        self.open_projects.get_mut(self.active_open)
+    }
+
+    fn any_brain_scanning(&self) -> bool {
+        self.open_projects.iter().any(|p| p.brain_scanning)
+    }
+
+    fn index_by_brain_dir(&self, brain_dir: &std::path::Path) -> Option<usize> {
+        self.open_projects
+            .iter()
+            .position(|p| p.entry.brain_dir == brain_dir)
+    }
+
+    fn index_by_project_id(&self, id: &str) -> Option<usize> {
+        self.open_projects.iter().position(|p| p.entry.id == id)
+    }
+
+    fn focus_open(&mut self, index: usize) {
+        if index >= self.open_projects.len() {
+            return;
+        }
+        self.active_open = index;
+        self.picking_second = false;
+        set_workspace(self.open_projects[index].entry.root.clone());
+        self.screen = DockScreen::PickProject;
+    }
+
+    fn open_or_focus_project(&mut self, entry: ProjectEntry, touch: bool) {
+        if let Some(existing) = self.index_by_project_id(&entry.id) {
+            self.focus_open(existing);
+            if touch {
+                let mut updated = self.open_projects[existing].entry.clone();
+                updated.last_used_unix = project::now_unix();
+                self.open_projects[existing].entry = updated.clone();
+                self.projects.upsert(updated);
+                let _ = self.projects.save();
+            }
+            return;
+        }
+
         let mut entry = entry;
         if touch {
             entry.last_used_unix = project::now_unix();
         }
+
+        if self.picking_second && self.open_projects.len() < MAX_OPEN_PROJECTS {
+            self.picking_second = false;
+            self.open_projects.push(OpenProject::new(entry.clone()));
+            self.active_open = self.open_projects.len() - 1;
+        } else if self.open_projects.is_empty() {
+            self.open_projects.push(OpenProject::new(entry.clone()));
+            self.active_open = 0;
+        } else if self.open_projects.len() < MAX_OPEN_PROJECTS {
+            // Abrir como segundo sin pedir el modo picking_second.
+            self.open_projects.push(OpenProject::new(entry.clone()));
+            self.active_open = self.open_projects.len() - 1;
+        } else {
+            // Reemplaza el slot activo; el otro se conserva.
+            let slot = OpenProject::new(entry.clone());
+            self.open_projects[self.active_open] = slot;
+        }
+
         set_workspace(entry.root.clone());
-        self.brain_status = None;
-        self.session_sync_pending = true;
-        self.brain_progress = "Comprobando rama y último índice…".into();
-        self.active_project = Some(entry.clone());
         self.projects.upsert(entry);
         if let Err(error) = self.projects.save() {
             self.notice = Some(error);
         }
-        if changed {
-            self.clear_all_chats();
+        self.screen = DockScreen::PickProject;
+    }
+
+    fn close_active_project(&mut self) {
+        if self.open_projects.is_empty() {
+            return;
+        }
+        let index = self.active_open.min(self.open_projects.len() - 1);
+        if let Some(pending) = self.open_projects[index].brain_cancel.take() {
+            pending.store(true, Ordering::Relaxed);
+        }
+        for chat in &mut self.open_projects[index].chats {
+            if let Some(pending) = chat.pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.open_projects.remove(index);
+        self.picking_second = false;
+        if self.open_projects.is_empty() {
+            self.active_open = 0;
+            self.brain_notice_clear_for_empty();
+        } else {
+            self.active_open = index.min(self.open_projects.len() - 1);
+            set_workspace(self.open_projects[self.active_open].entry.root.clone());
         }
         self.screen = DockScreen::PickProject;
+    }
+
+    fn brain_notice_clear_for_empty(&mut self) {
+        self.notice = None;
+        self.new_project = None;
+    }
+
+    fn other_open_index(&self) -> Option<usize> {
+        if self.open_projects.len() != 2 {
+            return None;
+        }
+        Some(1 - self.active_open.min(1))
+    }
+
+    fn transfer_context_from_other(&mut self) {
+        let Some(other_idx) = self.other_open_index() else {
+            self.notice = Some("Abrí un segundo proyecto para transferir contexto.".into());
+            return;
+        };
+        let active_idx = self.active_open;
+        let from_name = self.open_projects[other_idx].entry.name.clone();
+        let from_brain = self.open_projects[other_idx].entry.brain_dir.clone();
+        let to_name = self.open_projects[active_idx].entry.name.clone();
+        let to_brain = self.open_projects[active_idx].entry.brain_dir.clone();
+        match brain::transfer_context(&from_name, &from_brain, &to_brain) {
+            Ok(count) => {
+                self.notice = Some(format!(
+                    "Transferidos {count} doc(s) de `{from_name}` → `{to_name}`. Sin tokens: van al context del Brain."
+                ));
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     fn confirm_new_project(&mut self) {
@@ -444,28 +581,35 @@ impl YeisonDock {
             last_scan_files: 0,
             last_used_unix: project::now_unix(),
         };
-        self.activate_project(entry, true);
+        self.open_or_focus_project(entry, true);
     }
 
-    fn start_brain_sync(&mut self, ctx: &egui::Context, force_full: bool) {
-        if self.brain_scanning {
+    fn start_brain_sync_at(&mut self, index: usize, ctx: &egui::Context, force_full: bool) {
+        if index >= self.open_projects.len() {
             return;
         }
-        let Some(active) = self.active_project.clone() else {
-            self.notice = Some("Elegí un proyecto primero.".into());
+        if self.open_projects[index].brain_scanning {
             return;
-        };
+        }
+        if self.any_brain_scanning() {
+            // Un scan a la vez; el pendiente sigue marcado.
+            return;
+        }
+        let active = self.open_projects[index].entry.clone();
         if let Err(error) = std::fs::create_dir_all(&active.brain_dir) {
             self.notice = Some(format!("No se pudo crear el brain: {error}"));
             return;
         }
 
         let cancel = new_cancel_flag();
-        self.brain_cancel = Some(cancel.clone());
-        self.brain_scan_target = Some(active.brain_dir.clone());
-        self.session_sync_pending = false;
-        self.brain_scanning = true;
-        self.brain_progress = "Comprobando rama y último índice…".into();
+        {
+            let slot = &mut self.open_projects[index];
+            slot.brain_cancel = Some(cancel.clone());
+            slot.brain_scan_target = Some(active.brain_dir.clone());
+            slot.session_sync_pending = false;
+            slot.brain_scanning = true;
+            slot.brain_progress = "Comprobando rama y último índice…".into();
+        }
         self.notice = None;
 
         let tx = self.ui_tx.clone();
@@ -474,13 +618,17 @@ impl YeisonDock {
         std::thread::spawn(move || {
             let tx_progress = tx.clone();
             let ctx_progress = ctx.clone();
+            let brain_for_progress = brain_dir.clone();
             let result = brain::sync_session(
                 &active.root,
                 &active.brain_dir,
                 force_full,
                 &cancel,
                 |message| {
-                    let _ = tx_progress.send(UiEvent::BrainProgress(message));
+                    let _ = tx_progress.send(UiEvent::BrainProgress {
+                        brain_dir: brain_for_progress.clone(),
+                        text: message,
+                    });
                     ctx_progress.request_repaint();
                 },
             );
@@ -493,37 +641,50 @@ impl YeisonDock {
         });
     }
 
+    fn start_brain_sync(&mut self, ctx: &egui::Context, force_full: bool) {
+        if self.open_projects.is_empty() {
+            self.notice = Some("Elegí un proyecto primero.".into());
+            return;
+        }
+        self.start_brain_sync_at(self.active_open, ctx, force_full);
+    }
+
     fn kick_session_sync(&mut self, ctx: &egui::Context) {
-        if self.session_sync_pending
-            && !self.brain_scanning
-            && !self.picker_open
-            && self.active_project.is_some()
-        {
-            self.start_brain_sync(ctx, false);
+        if self.picker_open || self.any_brain_scanning() {
+            return;
+        }
+        let pending = self
+            .open_projects
+            .iter()
+            .position(|p| p.session_sync_pending);
+        if let Some(index) = pending {
+            self.start_brain_sync_at(index, ctx, false);
         }
     }
 
     fn stop_brain_scan(&mut self) {
-        if let Some(cancel) = &self.brain_cancel {
+        let Some(slot) = self.active_mut() else {
+            return;
+        };
+        if let Some(cancel) = &slot.brain_cancel {
             cancel.store(true, Ordering::Relaxed);
             self.notice = Some("Deteniendo escaneo…".into());
         }
     }
 
-    fn apply_brain_status(&mut self, status: brain::BrainStatus) {
+    fn apply_brain_status_at(&mut self, index: usize, status: brain::BrainStatus) {
         let files = status.files;
         let scanned_at = status.scanned_at_unix;
-        self.brain_status = Some(status);
-        let Some(active) = self.active_project.clone() else {
+        let Some(slot) = self.open_projects.get_mut(index) else {
             return;
         };
-        if active.scanned_at_unix == scanned_at && active.last_scan_files == files {
+        slot.brain_status = Some(status);
+        if slot.entry.scanned_at_unix == scanned_at && slot.entry.last_scan_files == files {
             return;
         }
-        let mut updated = active;
-        updated.scanned_at_unix = scanned_at;
-        updated.last_scan_files = files;
-        self.active_project = Some(updated.clone());
+        slot.entry.scanned_at_unix = scanned_at;
+        slot.entry.last_scan_files = files;
+        let updated = slot.entry.clone();
         self.projects.upsert(updated);
         if let Err(error) = self.projects.save() {
             self.notice = Some(error);
@@ -531,7 +692,7 @@ impl YeisonDock {
     }
 
     fn ingest_files(&mut self, paths: Vec<PathBuf>) {
-        let Some(active) = self.active_project.clone() else {
+        let Some(active) = self.active().map(|p| p.entry.clone()) else {
             self.notice = Some("Elegí un proyecto primero.".into());
             return;
         };
@@ -601,7 +762,7 @@ impl YeisonDock {
 
     fn apply_project_action(&mut self, action: ProjectAction, ctx: &egui::Context) {
         match action {
-            ProjectAction::Select(entry) => self.activate_project(entry, true),
+            ProjectAction::Select(entry) => self.open_or_focus_project(entry, true),
             ProjectAction::Create => self.confirm_new_project(),
             ProjectAction::CancelCreate => {
                 self.new_project = None;
@@ -614,7 +775,10 @@ impl YeisonDock {
             ProjectAction::Rebuild => self.start_brain_sync(ctx, true),
             ProjectAction::StopScan => self.stop_brain_scan(),
             ProjectAction::Continue => {
-                if self.chats.iter().any(|slot| slot.agent.is_some()) {
+                let has_agent = self
+                    .active()
+                    .is_some_and(|p| p.chats.iter().any(|slot| slot.agent.is_some()));
+                if has_agent {
                     self.screen = DockScreen::Chat;
                     self.focus_input = true;
                 } else {
@@ -623,12 +787,21 @@ impl YeisonDock {
                 }
             }
             ProjectAction::Change => {
-                self.active_project = None;
-                self.brain_status = None;
-                self.session_sync_pending = false;
+                self.close_active_project();
                 self.new_project = None;
                 self.notice = None;
             }
+            ProjectAction::Focus(index) => self.focus_open(index),
+            ProjectAction::CloseActive => self.close_active_project(),
+            ProjectAction::OpenSecond => {
+                if self.open_projects.len() >= MAX_OPEN_PROJECTS {
+                    self.notice = Some("Ya hay dos proyectos abiertos. Cerrá uno primero.".into());
+                } else {
+                    self.picking_second = true;
+                    self.notice = Some("Elegí el segundo proyecto. El primero se queda abierto.".into());
+                }
+            }
+            ProjectAction::TransferContext => self.transfer_context_from_other(),
         }
     }
 
@@ -698,7 +871,7 @@ impl YeisonDock {
     }
 
     fn start_chat(&mut self) {
-        if self.active_project.is_none() {
+        if self.active().is_none() {
             self.screen = DockScreen::PickProject;
             return;
         }
@@ -729,8 +902,11 @@ impl YeisonDock {
     /// Cambia el modelo solo del chat que estás viendo. El historial se queda;
     /// la próxima respuesta abre una sesión nueva del proveedor.
     fn apply_agent(&mut self, selection: AgentSelection) {
-        let index = self.active_chat;
-        let same = self.chats[index].agent.as_ref().is_some_and(|current| {
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        let index = project.active_chat;
+        let same = project.chats[index].agent.as_ref().is_some_and(|current| {
             current.provider.id == selection.provider.id
                 && current.model_id == selection.model_id
                 && current.cursor_mode == selection.cursor_mode
@@ -738,11 +914,11 @@ impl YeisonDock {
         if same {
             return;
         }
-        if let Some(pending) = self.chats[index].pending.take() {
+        if let Some(pending) = project.chats[index].pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        let had_history = !self.chats[index].messages.is_empty();
-        self.chats[index].session = SessionState::Empty;
+        let had_history = !project.chats[index].messages.is_empty();
+        project.chats[index].session = SessionState::Empty;
         let label = selection
             .provider
             .models
@@ -751,9 +927,9 @@ impl YeisonDock {
             .map(|model| model.label.clone())
             .unwrap_or_else(|| selection.model_id.clone());
         let provider_name = selection.provider.display_name.clone();
-        self.chats[index].agent = Some(selection);
+        project.chats[index].agent = Some(selection);
         if had_history {
-            self.chats[index].messages.push(ChatMessage {
+            project.chats[index].messages.push(ChatMessage {
                 role: MessageRole::Note,
                 text: format!("Sesión nueva con {provider_name} · {label}."),
             });
@@ -761,71 +937,85 @@ impl YeisonDock {
     }
 
     fn open_model_picker(&mut self) {
-        if let Some(agent) = &self.chats[self.active_chat].agent {
-            self.selected_provider = Some(agent.provider.id.clone());
-            self.selected_model_id = agent.model_id.clone();
-            if let Some(mode) = agent.cursor_mode {
+        let agent_info = self.active().and_then(|project| {
+            project.chats.get(project.active_chat).and_then(|slot| {
+                slot.agent.as_ref().map(|agent| {
+                    (
+                        agent.provider.id.clone(),
+                        agent.model_id.clone(),
+                        agent.cursor_mode,
+                    )
+                })
+            })
+        });
+        if let Some((provider_id, model_id, cursor_mode)) = agent_info {
+            self.selected_provider = Some(provider_id);
+            self.selected_model_id = model_id;
+            if let Some(mode) = cursor_mode {
                 self.picker_mode = mode;
             }
         }
         self.model_filter.clear();
         self.model_pick_from_chat = true;
-        self.tab_menu_open = false;
+        if let Some(project) = self.active_mut() {
+            project.tab_menu_open = false;
+        }
         self.screen = DockScreen::PickProvider;
     }
 
     fn add_chat(&mut self) {
-        self.chats.push(ChatSlot::empty());
-        self.active_chat = self.chats.len() - 1;
-        self.focus_input = true;
-        if self.chats.len() <= MAX_VISIBLE_TABS {
-            self.tab_menu_open = false;
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        project.chats.push(ChatSlot::empty());
+        project.active_chat = project.chats.len() - 1;
+        let collapse = project.chats.len() <= MAX_VISIBLE_TABS;
+        if collapse {
+            project.tab_menu_open = false;
         }
+        self.focus_input = true;
     }
 
     fn close_chat(&mut self, index: usize) {
-        if self.chats.len() <= 1 || index >= self.chats.len() {
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        if project.chats.len() <= 1 || index >= project.chats.len() {
             return;
         }
-        if let Some(pending) = self.chats[index].pending.take() {
+        if let Some(pending) = project.chats[index].pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        self.chats.remove(index);
-        if self.active_chat > index {
-            self.active_chat -= 1;
+        project.chats.remove(index);
+        if project.active_chat > index {
+            project.active_chat -= 1;
         }
-        if self.active_chat >= self.chats.len() {
-            self.active_chat = self.chats.len() - 1;
+        if project.active_chat >= project.chats.len() {
+            project.active_chat = project.chats.len() - 1;
         }
-        if self.chats.len() <= MAX_VISIBLE_TABS {
-            self.tab_menu_open = false;
+        if project.chats.len() <= MAX_VISIBLE_TABS {
+            project.tab_menu_open = false;
         }
         self.focus_input = true;
     }
 
     fn new_chat(&mut self) {
         self.cancel_pending();
-        let slot = &mut self.chats[self.active_chat];
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        let slot = &mut project.chats[project.active_chat];
         slot.messages.clear();
         slot.session = SessionState::Empty;
         slot.draft.clear();
         self.focus_input = true;
     }
 
-    fn clear_all_chats(&mut self) {
-        for index in 0..self.chats.len() {
-            if let Some(pending) = self.chats[index].pending.take() {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
-            self.chats[index].messages.clear();
-            self.chats[index].session = SessionState::Empty;
-            self.chats[index].draft.clear();
-        }
-        self.focus_input = false;
-    }
-
     fn cancel_pending(&mut self) {
-        let slot = &mut self.chats[self.active_chat];
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        let slot = &mut project.chats[project.active_chat];
         if let Some(pending) = slot.pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
             if !pending.text.trim().is_empty() {
@@ -842,82 +1032,96 @@ impl YeisonDock {
         }
     }
 
-    fn chat_index_for_seq(&self, seq: u64) -> Option<usize> {
-        self.chats.iter().position(|slot| {
-            slot.pending
-                .as_ref()
-                .is_some_and(|pending| pending.seq == seq)
-        })
+    /// (proyecto_abierto, índice_de_chat) para una respuesta en vuelo.
+    fn chat_loc_for_seq(&self, seq: u64) -> Option<(usize, usize)> {
+        for (open_idx, project) in self.open_projects.iter().enumerate() {
+            if let Some(chat_idx) = project.chats.iter().position(|slot| {
+                slot.pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.seq == seq)
+            }) {
+                return Some((open_idx, chat_idx));
+            }
+        }
+        None
     }
 
     fn pending_mut(&mut self, seq: u64) -> Option<&mut PendingReply> {
-        self.chats.iter_mut().find_map(|slot| {
-            slot.pending
-                .as_mut()
-                .filter(|pending| pending.seq == seq)
-        })
+        for project in &mut self.open_projects {
+            if let Some(pending) = project.chats.iter_mut().find_map(|slot| {
+                slot.pending
+                    .as_mut()
+                    .filter(|pending| pending.seq == seq)
+            }) {
+                return Some(pending);
+            }
+        }
+        None
     }
 
     fn send_draft(&mut self, ctx: &egui::Context) {
-        let index = self.active_chat;
-        let text = self.chats[index].draft.trim().to_string();
-        if text.is_empty() || self.chats[index].pending.is_some() {
-            return;
-        }
-        let Some(selection) = self.chats[index].agent.clone() else {
+        let Some(project) = self.active() else {
             return;
         };
+        let index = project.active_chat;
+        let text = project.chats[index].draft.trim().to_string();
+        if text.is_empty() || project.chats[index].pending.is_some() {
+            return;
+        }
+        let Some(selection) = project.chats[index].agent.clone() else {
+            return;
+        };
+        let entry = project.entry.clone();
+        set_workspace(entry.root.clone());
 
-        let project = self.active_project.clone();
-
-        self.chats[index].messages.push(ChatMessage {
+        let project = self.active_mut().unwrap();
+        project.chats[index].messages.push(ChatMessage {
             role: MessageRole::User,
             text: text.clone(),
         });
-        self.chats[index].draft.clear();
+        project.chats[index].draft.clear();
         self.focus_input = true;
 
         self.reply_gen += 1;
         let seq = self.reply_gen;
         let cancel = new_cancel_flag();
-        self.chats[index].pending = Some(PendingReply {
+        let project = self.active_mut().unwrap();
+        project.chats[index].pending = Some(PendingReply {
             seq,
             text: String::new(),
             thinking: false,
             started: Instant::now(),
             cancel: cancel.clone(),
         });
-
-        let mut session = self.chats[index].session.clone();
+        let mut session = project.chats[index].session.clone();
         let tx = self.ui_tx.clone();
         let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
             let tx_events = tx.clone();
             let ctx_events = ctx_clone.clone();
-            let (effective, cancelled) = if let Some(active) = project {
-                let brain_dir = active.brain_dir.clone();
-                let (prompt, outcome) = brain::compose_prompt_live(
-                    &active.name,
-                    &active.root,
-                    &active.brain_dir,
-                    &text,
-                    &cancel,
-                    |message| {
-                        let _ = tx_events.send(UiEvent::BrainProgress(message));
-                        ctx_events.request_repaint();
-                    },
-                );
-                let cancelled = cancel.load(Ordering::Relaxed)
-                    || matches!(&outcome, Err(error) if error == "Escaneo cancelado.");
-                let _ = tx.send(UiEvent::BrainSynced {
-                    brain_dir,
-                    result: outcome,
-                    from_scan: false,
-                });
-                (prompt, cancelled)
-            } else {
-                (text.clone(), cancel.load(Ordering::Relaxed))
-            };
+            let brain_dir = entry.brain_dir.clone();
+            let brain_for_progress = brain_dir.clone();
+            let (prompt, outcome) = brain::compose_prompt_live(
+                &entry.name,
+                &entry.root,
+                &entry.brain_dir,
+                &text,
+                &cancel,
+                |message| {
+                    let _ = tx_events.send(UiEvent::BrainProgress {
+                        brain_dir: brain_for_progress.clone(),
+                        text: message,
+                    });
+                    ctx_events.request_repaint();
+                },
+            );
+            let cancelled = cancel.load(Ordering::Relaxed)
+                || matches!(&outcome, Err(error) if error == "Escaneo cancelado.");
+            let _ = tx.send(UiEvent::BrainSynced {
+                brain_dir,
+                result: outcome,
+                from_scan: false,
+            });
             if cancelled {
                 let _ = tx.send(UiEvent::ReplyFailed {
                     seq,
@@ -927,7 +1131,7 @@ impl YeisonDock {
                 return;
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                send_message(&selection, &mut session, &effective, &cancel, |event| {
+                send_message(&selection, &mut session, &prompt, &cancel, |event| {
                     let ui_event = match event {
                         StreamEvent::Thinking => UiEvent::ReplyThinking { seq },
                         StreamEvent::Delta(t) => UiEvent::ReplyDelta { seq, text: t },
@@ -1003,10 +1207,11 @@ impl YeisonDock {
                     }
                 }
                 UiEvent::ReplyDone { seq, text, session } => {
-                    if let Some(index) = self.chat_index_for_seq(seq) {
-                        self.chats[index].pending = None;
-                        self.chats[index].session = session;
-                        self.chats[index].messages.push(ChatMessage {
+                    if let Some((open_idx, chat_idx)) = self.chat_loc_for_seq(seq) {
+                        let chat = &mut self.open_projects[open_idx].chats[chat_idx];
+                        chat.pending = None;
+                        chat.session = session;
+                        chat.messages.push(ChatMessage {
                             role: MessageRole::Assistant,
                             text,
                         });
@@ -1014,10 +1219,11 @@ impl YeisonDock {
                     }
                 }
                 UiEvent::ReplyFailed { seq, error } => {
-                    let Some(index) = self.chat_index_for_seq(seq) else {
+                    let Some((open_idx, chat_idx)) = self.chat_loc_for_seq(seq) else {
                         continue;
                     };
-                    let partial = self.chats[index]
+                    let chat = &mut self.open_projects[open_idx].chats[chat_idx];
+                    let partial = chat
                         .pending
                         .take()
                         .map(|pending| pending.text)
@@ -1026,41 +1232,42 @@ impl YeisonDock {
                         continue;
                     }
                     if !partial.trim().is_empty() {
-                        self.chats[index].messages.push(ChatMessage {
+                        chat.messages.push(ChatMessage {
                             role: MessageRole::Assistant,
                             text: partial,
                         });
                     }
-                    self.chats[index].messages.push(ChatMessage {
+                    chat.messages.push(ChatMessage {
                         role: MessageRole::Error,
                         text: error,
                     });
                     self.mark_robot_error();
                 }
-                UiEvent::BrainProgress(text) => {
-                    self.brain_progress = text;
+                UiEvent::BrainProgress { brain_dir, text } => {
+                    if let Some(index) = self.index_by_brain_dir(&brain_dir) {
+                        self.open_projects[index].brain_progress = text;
+                    }
                 }
                 UiEvent::BrainSynced {
                     brain_dir,
                     result,
                     from_scan,
                 } => {
-                    if from_scan {
-                        self.brain_scanning = false;
-                        self.brain_cancel = None;
-                        self.brain_scan_target = None;
-                    }
-                    self.brain_progress.clear();
-                    let matches_active = self
-                        .active_project
-                        .as_ref()
-                        .is_some_and(|active| active.brain_dir == brain_dir);
-                    if !matches_active {
+                    let Some(index) = self.index_by_brain_dir(&brain_dir) else {
                         continue;
+                    };
+                    {
+                        let slot = &mut self.open_projects[index];
+                        if from_scan {
+                            slot.brain_scanning = false;
+                            slot.brain_cancel = None;
+                            slot.brain_scan_target = None;
+                        }
+                        slot.brain_progress.clear();
                     }
                     match result {
                         Ok(SyncOutcome::Unchanged(status)) => {
-                            self.apply_brain_status(status.clone());
+                            self.apply_brain_status_at(index, status.clone());
                             if from_scan {
                                 let git = if status.git.available {
                                     format!(
@@ -1076,7 +1283,7 @@ impl YeisonDock {
                             }
                         }
                         Ok(SyncOutcome::Updated(status, report)) => {
-                            self.apply_brain_status(status);
+                            self.apply_brain_status_at(index, status);
                             self.notice = Some(format_sync_report(&report));
                             self.mark_robot_done();
                         }
@@ -1096,8 +1303,11 @@ impl YeisonDock {
             }
         }
 
-        let chat_busy = self.chats.iter().any(|slot| slot.pending.is_some());
-        if chat_busy || self.catalog_scanning || self.brain_scanning || self.picker_open {
+        let chat_busy = self
+            .open_projects
+            .iter()
+            .any(|p| p.chats.iter().any(|slot| slot.pending.is_some()));
+        if chat_busy || self.catalog_scanning || self.any_brain_scanning() || self.picker_open {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
@@ -1143,20 +1353,32 @@ impl YeisonDock {
 
     fn robot_mood(&self) -> robot::Mood {
         let now = Instant::now();
-        let replying = self.chats.iter().any(|slot| slot.pending.is_some());
-        let streaming = self.chats.iter().any(|slot| {
-            slot.pending
-                .as_ref()
-                .is_some_and(|pending| !pending.text.trim().is_empty())
+        let replying = self
+            .open_projects
+            .iter()
+            .any(|p| p.chats.iter().any(|slot| slot.pending.is_some()));
+        let streaming = self.open_projects.iter().any(|p| {
+            p.chats.iter().any(|slot| {
+                slot.pending
+                    .as_ref()
+                    .is_some_and(|pending| !pending.text.trim().is_empty())
+            })
         });
+        let syncing = self.open_projects.iter().any(|p| {
+            p.session_sync_pending
+                || (!p.brain_progress.is_empty() && !p.brain_scanning && !replying)
+        });
+        let stale = self
+            .active()
+            .and_then(|p| p.brain_status.as_ref())
+            .is_some_and(|status| status.stale);
         robot::resolve(robot::Signals {
             replying,
             streaming,
-            scanning: self.brain_scanning || self.catalog_scanning,
-            syncing: self.session_sync_pending
-                || (!self.brain_progress.is_empty() && !self.brain_scanning && !replying),
+            scanning: self.any_brain_scanning() || self.catalog_scanning,
+            syncing,
             error: self.robot_error_until.is_some_and(|until| now < until),
-            stale: self.brain_status.as_ref().is_some_and(|status| status.stale),
+            stale,
             just_done: self.robot_done_until.is_some_and(|until| now < until),
         })
     }
@@ -1205,7 +1427,10 @@ impl YeisonDock {
         self.display_idx = Some(idx);
         self.press_began_on_dock = true;
         self.outside_click_enabled_after = Some(Instant::now() + OPEN_CLICK_GRACE);
-        if self.active_project.is_some() && self.chats.iter().any(|slot| slot.agent.is_some()) {
+        if self
+            .active()
+            .is_some_and(|p| p.chats.iter().any(|slot| slot.agent.is_some()))
+        {
             self.screen = DockScreen::Chat;
             self.focus_input = true;
         }
@@ -1746,7 +1971,7 @@ impl YeisonDock {
     }
 
     fn active_index_label(&self) -> (String, egui::Color32) {
-        let Some(status) = &self.brain_status else {
+        let Some(status) = self.active().and_then(|p| p.brain_status.as_ref()) else {
             return (
                 "Comprobando rama y último índice…".into(),
                 palette::WARN,
@@ -1813,6 +2038,33 @@ impl YeisonDock {
                     });
                     ui.add_space(8.0);
 
+                    // Chips de los proyectos abiertos (hasta 2).
+                    if !self.open_projects.is_empty() && self.new_project.is_none() && !self.picking_second {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let names: Vec<(usize, String)> = self
+                                .open_projects
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| (i, p.entry.name.clone()))
+                                .collect();
+                            let count = names.len() as f32;
+                            let gap = 6.0;
+                            let gaps = gap * (count - 1.0).max(0.0);
+                            let chip_w = ((ui.available_width() - gaps) / count.max(1.0)).max(48.0);
+                            for (index, name) in names {
+                                let mut label: String = name.chars().take(12).collect();
+                                if name.chars().count() > 12 {
+                                    label.push('…');
+                                }
+                                if Self::pill(ui, &label, self.active_open == index, chip_w) {
+                                    action = Some(ProjectAction::Focus(index));
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+
                     if let Some(draft) = &mut self.new_project {
                         ui.label(
                             egui::RichText::new("Nuevo proyecto")
@@ -1864,107 +2116,42 @@ impl YeisonDock {
                         if Self::primary_button(ui, "Crear y escanear", true, true) {
                             action = Some(ProjectAction::Create);
                         }
-                    } else if let Some(project) = self.active_project.clone() {
-                        Self::card(ui, false, |ui| {
-                            ui.label(
-                                egui::RichText::new(&project.name)
-                                    .strong()
-                                    .size(15.0)
-                                    .color(palette::TEXT),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "Raíz: {}",
-                                        project.root.display()
-                                    ))
-                                    .size(9.5)
-                                    .color(palette::TEXT_DIM),
-                                )
-                                .wrap(),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "Brain: {}",
-                                        project.brain_dir.display()
-                                    ))
-                                    .size(9.0)
-                                    .color(palette::TEXT_MUTED),
-                                )
-                                .wrap(),
-                            );
-                            let (status, color) = self.active_index_label();
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(status).size(10.0).color(color),
-                                )
-                                .wrap(),
-                            );
-                        });
-                        ui.add_space(8.0);
-
-                        if self.brain_scanning {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Spinner::new().size(13.0).color(palette::ACCENT));
-                                ui.label(
-                                    egui::RichText::new(&self.brain_progress)
-                                        .size(10.0)
-                                        .color(palette::TEXT_DIM),
-                                );
-                            });
-                            ui.add_space(5.0);
-                            if Self::ghost_button(ui, "Detener escaneo") {
-                                action = Some(ProjectAction::StopScan);
-                            }
+                    } else if self.picking_second || self.active().is_none() {
+                        let title = if self.picking_second {
+                            "Segundo proyecto"
                         } else {
-                            let index_label = if project.scanned_at_unix == 0 {
-                                "Crear índice"
-                            } else {
-                                "Actualizar índice"
-                            };
-                            ui.horizontal(|ui| {
-                                if Self::primary_button(ui, index_label, true, false) {
-                                    action = Some(ProjectAction::StartScan);
-                                }
-                                if Self::ghost_button(ui, "Añadir archivos") {
-                                    action = Some(ProjectAction::PickFiles);
-                                }
-                            });
-                            ui.add_space(4.0);
-                            if Self::ghost_button(ui, "Reconstruir índice") {
-                                action = Some(ProjectAction::Rebuild);
-                            }
-                            ui.add_space(6.0);
-                            let open_label = if self.chats.iter().any(|slot| slot.agent.is_some()) {
-                                "Abrir chats"
-                            } else {
-                                "Elegir IA y chatear"
-                            };
-                            if Self::primary_button(ui, open_label, true, true) {
-                                action = Some(ProjectAction::Continue);
-                            }
-                            ui.add_space(4.0);
-                            if Self::ghost_button(ui, "Cambiar de proyecto") {
-                                action = Some(ProjectAction::Change);
-                            }
-                        }
-                    } else {
+                            "Elegí un proyecto"
+                        };
                         ui.label(
-                            egui::RichText::new("Elegí un proyecto")
+                            egui::RichText::new(title)
                                 .strong()
                                 .size(12.5)
                                 .color(palette::TEXT_DIM),
                         );
                         ui.label(
                             egui::RichText::new(
-                                "Al abrirlo se comprueba la rama y el último índice. \
-                                 Si hay cambios, se actualiza sólo eso. No consume tokens.",
+                                if self.picking_second {
+                                    "El primero se queda abierto con su Brain y chats. \
+                                     Transferí contexto después si querés compartir datos precargados."
+                                } else {
+                                    "Al abrirlo se comprueba la rama y el último índice. \
+                                     Si hay cambios, se actualiza sólo eso. No consume tokens."
+                                },
                             )
                             .size(9.5)
                             .color(palette::TEXT_MUTED),
                         );
                         ui.add_space(6.0);
+
+                        if self.picking_second {
+                            ui.horizontal(|ui| {
+                                if Self::ghost_button(ui, "Cancelar") {
+                                    self.picking_second = false;
+                                    self.notice = None;
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
 
                         if self.projects.projects.is_empty() {
                             ui.add_space(14.0);
@@ -1985,6 +2172,11 @@ impl YeisonDock {
                             });
                             ui.add_space(12.0);
                         } else {
+                            let open_ids: std::collections::BTreeSet<String> = self
+                                .open_projects
+                                .iter()
+                                .map(|p| p.entry.id.clone())
+                                .collect();
                             let list = self.projects.projects.clone();
                             let height = (ui.available_height() - 48.0).max(80.0);
                             egui::ScrollArea::vertical()
@@ -1992,6 +2184,9 @@ impl YeisonDock {
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     for project in list {
+                                        if open_ids.contains(&project.id) {
+                                            continue;
+                                        }
                                         let scanned = if project.scanned_at_unix == 0 {
                                             "sin escanear".to_string()
                                         } else {
@@ -2034,6 +2229,126 @@ impl YeisonDock {
                         if Self::primary_button(ui, "Agregar proyecto", true, true) {
                             action = Some(ProjectAction::PickRoot);
                         }
+                    } else if let Some(project) = self.active().map(|p| p.entry.clone()) {
+                        let scanning = self.active().is_some_and(|p| p.brain_scanning);
+                        let progress = self
+                            .active()
+                            .map(|p| p.brain_progress.clone())
+                            .unwrap_or_default();
+                        let has_agent = self
+                            .active()
+                            .is_some_and(|p| p.chats.iter().any(|slot| slot.agent.is_some()));
+                        let other_name = self
+                            .other_open_index()
+                            .map(|i| self.open_projects[i].entry.name.clone());
+
+                        Self::card(ui, false, |ui| {
+                            ui.label(
+                                egui::RichText::new(&project.name)
+                                    .strong()
+                                    .size(15.0)
+                                    .color(palette::TEXT),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "Raíz: {}",
+                                        project.root.display()
+                                    ))
+                                    .size(9.5)
+                                    .color(palette::TEXT_DIM),
+                                )
+                                .wrap(),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "Brain: {}",
+                                        project.brain_dir.display()
+                                    ))
+                                    .size(9.0)
+                                    .color(palette::TEXT_MUTED),
+                                )
+                                .wrap(),
+                            );
+                            let (status, color) = self.active_index_label();
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(status).size(10.0).color(color),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        ui.add_space(8.0);
+
+                        if scanning {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(13.0).color(palette::ACCENT));
+                                ui.label(
+                                    egui::RichText::new(&progress)
+                                        .size(10.0)
+                                        .color(palette::TEXT_DIM),
+                                );
+                            });
+                            ui.add_space(5.0);
+                            if Self::ghost_button(ui, "Detener escaneo") {
+                                action = Some(ProjectAction::StopScan);
+                            }
+                        } else {
+                            let index_label = if project.scanned_at_unix == 0 {
+                                "Crear índice"
+                            } else {
+                                "Actualizar índice"
+                            };
+                            ui.horizontal(|ui| {
+                                if Self::primary_button(ui, index_label, true, false) {
+                                    action = Some(ProjectAction::StartScan);
+                                }
+                                if Self::ghost_button(ui, "Añadir archivos") {
+                                    action = Some(ProjectAction::PickFiles);
+                                }
+                            });
+                            ui.add_space(4.0);
+                            if Self::ghost_button(ui, "Reconstruir índice") {
+                                action = Some(ProjectAction::Rebuild);
+                            }
+                            ui.add_space(6.0);
+                            let open_label = if has_agent {
+                                "Abrir chats"
+                            } else {
+                                "Elegir IA y chatear"
+                            };
+                            if Self::primary_button(ui, open_label, true, true) {
+                                action = Some(ProjectAction::Continue);
+                            }
+                            ui.add_space(4.0);
+                            if let Some(other) = &other_name {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Copia el Brain de `{other}` acá. No usa tokens."
+                                    ))
+                                    .size(9.0)
+                                    .color(palette::TEXT_MUTED),
+                                );
+                                if Self::ghost_button(ui, "Transferir contexto") {
+                                    action = Some(ProjectAction::TransferContext);
+                                }
+                                ui.add_space(4.0);
+                            } else if self.open_projects.len() < MAX_OPEN_PROJECTS {
+                                if Self::ghost_button(ui, "Abrir segundo proyecto") {
+                                    action = Some(ProjectAction::OpenSecond);
+                                }
+                                ui.add_space(4.0);
+                            }
+                            ui.horizontal(|ui| {
+                                if Self::ghost_button(ui, "Cerrar este proyecto") {
+                                    action = Some(ProjectAction::CloseActive);
+                                }
+                                if Self::ghost_button(ui, "Cambiar de proyecto") {
+                                    action = Some(ProjectAction::Change);
+                                }
+                            });
+                        }
                     }
 
                     if let Some(notice) = &self.notice {
@@ -2062,7 +2377,7 @@ impl YeisonDock {
     // ----- Pantalla: proveedores -----
 
     fn show_pick_provider(&mut self, ui: &mut egui::Ui) {
-        if self.active_project.is_none() {
+        if self.active().is_none() {
             self.screen = DockScreen::PickProject;
             return;
         }
@@ -2088,8 +2403,12 @@ impl YeisonDock {
                         self.expand_control(ui);
                     });
                 });
+                let chat_n = self
+                    .active()
+                    .map(|p| p.active_chat + 1)
+                    .unwrap_or(1);
                 let hint = if self.model_pick_from_chat {
-                    format!("Modelo del chat {}", self.active_chat + 1)
+                    format!("Modelo del chat {chat_n}")
                 } else {
                     "Elige con qué asistente quieres hablar".into()
                 };
@@ -2454,8 +2773,12 @@ impl YeisonDock {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     let can_start = !self.selected_model_id.is_empty();
+                    let chat_n = self
+                        .active()
+                        .map(|p| p.active_chat + 1)
+                        .unwrap_or(1);
                     let start_label = if self.model_pick_from_chat {
-                        format!("Usar en el chat {}", self.active_chat + 1)
+                        format!("Usar en el chat {chat_n}")
                     } else {
                         "Empezar a chatear".into()
                     };
@@ -2470,15 +2793,16 @@ impl YeisonDock {
     // ----- Pantalla: chat -----
 
     fn chat_title(&self) -> (String, String) {
-        let Some(agent) = self
-            .chats
-            .get(self.active_chat)
-            .and_then(|slot| slot.agent.as_ref())
-        else {
-            return (
-                format!("Chat {}", self.active_chat + 1),
-                "Elegí un modelo".into(),
-            );
+        let chat_n = self
+            .active()
+            .map(|p| p.active_chat + 1)
+            .unwrap_or(1);
+        let Some(agent) = self.active().and_then(|p| {
+            p.chats
+                .get(p.active_chat)
+                .and_then(|slot| slot.agent.as_ref())
+        }) else {
+            return (format!("Chat {chat_n}"), "Elegí un modelo".into());
         };
         let model_label = agent
             .provider
@@ -2558,12 +2882,15 @@ impl YeisonDock {
     }
 
     fn show_window_bar(&mut self, ui: &mut egui::Ui) {
-        if self.chats.is_empty() {
-            self.chats.push(ChatSlot::empty());
-            self.active_chat = 0;
+        let Some(project) = self.active_mut() else {
+            return;
+        };
+        if project.chats.is_empty() {
+            project.chats.push(ChatSlot::empty());
+            project.active_chat = 0;
         }
-        if self.active_chat >= self.chats.len() {
-            self.active_chat = self.chats.len() - 1;
+        if project.active_chat >= project.chats.len() {
+            project.active_chat = project.chats.len() - 1;
         }
 
         ui.horizontal(|ui| {
@@ -2572,41 +2899,61 @@ impl YeisonDock {
                 .on_hover_text("Volver al proyecto")
                 .clicked()
             {
-                self.tab_menu_open = false;
+                if let Some(project) = self.active_mut() {
+                    project.tab_menu_open = false;
+                }
                 self.screen = DockScreen::PickProject;
             }
 
             let tools = 34.0 * 2.0 + 8.0;
             let tabs_w = (ui.available_width() - tools).max(48.0);
+            let mut switch_to = None;
+            let mut toggle_menu = false;
             ui.allocate_ui_with_layout(
                 egui::vec2(tabs_w, 34.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if self.chats.len() > MAX_VISIBLE_TABS {
-                        let index = self.active_chat;
-                        let label = self.chats[index].tab_label(index, true);
-                        if Self::window_chip(ui, &label, self.tab_menu_open, ui.available_width())
+                    let Some(project) = self.active() else {
+                        return;
+                    };
+                    if project.chats.len() > MAX_VISIBLE_TABS {
+                        let index = project.active_chat;
+                        let label = project.chats[index].tab_label(index, true);
+                        if Self::window_chip(ui, &label, project.tab_menu_open, ui.available_width())
                         {
-                            self.tab_menu_open = !self.tab_menu_open;
+                            toggle_menu = true;
                         }
                     } else {
-                        self.tab_menu_open = false;
-                        let count = self.chats.len();
+                        let count = project.chats.len();
                         let gap = 6.0;
                         let gaps = gap * count.saturating_sub(1) as f32;
                         let tab_w = ((ui.available_width() - gaps) / count as f32).max(36.0);
                         let with_model = tab_w >= 112.0;
                         for index in 0..count {
-                            let label = self.chats[index].tab_label(index, with_model);
-                            if Self::pill(ui, &label, self.active_chat == index, tab_w) {
-                                self.active_chat = index;
-                                self.focus_input = true;
+                            let label = project.chats[index].tab_label(index, with_model);
+                            if Self::pill(ui, &label, project.active_chat == index, tab_w) {
+                                switch_to = Some(index);
                             }
                         }
                     }
                 },
             );
+            if toggle_menu {
+                if let Some(project) = self.active_mut() {
+                    project.tab_menu_open = !project.tab_menu_open;
+                }
+            } else if let Some(index) = switch_to {
+                if let Some(project) = self.active_mut() {
+                    project.tab_menu_open = false;
+                    project.active_chat = index;
+                }
+                self.focus_input = true;
+            } else if let Some(project) = self.active_mut() {
+                if project.chats.len() <= MAX_VISIBLE_TABS {
+                    project.tab_menu_open = false;
+                }
+            }
 
             if Self::mark_button(ui, Mark::Plus, false)
                 .on_hover_text("Nueva ventana")
@@ -2617,7 +2964,10 @@ impl YeisonDock {
             self.expand_control(ui);
         });
 
-        if self.tab_menu_open && self.chats.len() > MAX_VISIBLE_TABS {
+        let show_menu = self
+            .active()
+            .is_some_and(|p| p.tab_menu_open && p.chats.len() > MAX_VISIBLE_TABS);
+        if show_menu {
             self.show_tab_menu(ui);
         }
     }
@@ -2625,7 +2975,25 @@ impl YeisonDock {
     fn show_tab_menu(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         let mut close_at = None;
+        let mut switch_to = None;
         let menu_h = if self.expanded { 320.0 } else { 168.0 };
+        let labels: Vec<(usize, String, bool)> = self
+            .active()
+            .map(|project| {
+                project
+                    .chats
+                    .iter()
+                    .enumerate()
+                    .map(|(index, slot)| {
+                        (
+                            index,
+                            slot.tab_label(index, true),
+                            project.active_chat == index,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         egui::Frame::new()
             .fill(palette::CARD)
             .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
@@ -2638,34 +3006,53 @@ impl YeisonDock {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
-                        let count = self.chats.len();
-                        for index in 0..count {
+                        for (index, label, selected) in &labels {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                let label = self.chats[index].tab_label(index, true);
                                 let row_w = (ui.available_width() - 40.0).max(48.0);
-                                if Self::pill(ui, &label, self.active_chat == index, row_w) {
-                                    self.active_chat = index;
-                                    self.tab_menu_open = false;
-                                    self.focus_input = true;
+                                if Self::pill(ui, label, *selected, row_w) {
+                                    switch_to = Some(*index);
                                 }
                                 if Self::mark_button(ui, Mark::Close, false)
                                     .on_hover_text("Cerrar ventana")
                                     .clicked()
                                 {
-                                    close_at = Some(index);
+                                    close_at = Some(*index);
                                 }
                             });
                         }
                     });
             });
+        if let Some(index) = switch_to {
+            if let Some(project) = self.active_mut() {
+                project.active_chat = index;
+                project.tab_menu_open = false;
+            }
+            self.focus_input = true;
+        }
         if let Some(index) = close_at {
             self.close_chat(index);
         }
     }
 
     fn show_chat(&mut self, ui: &mut egui::Ui) {
-        let project_name = self.active_project.as_ref().map(|p| p.name.clone());
+        if self.active().is_none() {
+            self.screen = DockScreen::PickProject;
+            return;
+        }
+        let project_name = self.active().map(|p| p.entry.name.clone());
+        let other = self.other_open_index().map(|i| {
+            (
+                i,
+                self.open_projects[i].entry.name.clone(),
+            )
+        });
+        let brain_status = self.active().and_then(|p| p.brain_status.clone());
+        let brain_progress = self
+            .active()
+            .map(|p| p.brain_progress.clone())
+            .unwrap_or_default();
+
         Self::paint_panel_background(ui, self.expanded);
         let inner = self.content_rect(ui);
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
@@ -2700,8 +3087,7 @@ impl YeisonDock {
                     });
                 });
                 if let Some(name) = &project_name {
-                    let index = self
-                        .brain_status
+                    let index = brain_status
                         .as_ref()
                         .map(|status| {
                             let git = if status.git.available {
@@ -2717,14 +3103,32 @@ impl YeisonDock {
                             format!("{name} · {git} · {freshness}")
                         })
                         .unwrap_or_else(|| format!("Proyecto: {name}"));
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(index).size(9.0).color(palette::TEXT_MUTED))
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(index).size(9.0).color(palette::TEXT_MUTED),
+                            )
                             .truncate(),
-                    );
+                        );
+                        if let Some((other_idx, other_name)) = &other {
+                            let mut short: String = other_name.chars().take(10).collect();
+                            if other_name.chars().count() > 10 {
+                                short.push('…');
+                            }
+                            if Self::ghost_button(ui, &format!("↔ {short}")) {
+                                self.focus_open(*other_idx);
+                                self.screen = DockScreen::Chat;
+                                self.focus_input = true;
+                            }
+                        }
+                    });
                 }
                 ui.add_space(8.0);
-                let chat = self.active_chat;
-                let has_model = self.chats[chat].agent.is_some();
+                let chat = self.active().map(|p| p.active_chat).unwrap_or(0);
+                let has_model = self
+                    .active()
+                    .and_then(|p| p.chats.get(chat))
+                    .is_some_and(|slot| slot.agent.is_some());
                 let input_h = 46.0;
                 let messages_h = (ui.available_height() - input_h).max(60.0);
                 let max_bubble_w = ui.available_width() * 0.88;
@@ -2735,8 +3139,11 @@ impl YeisonDock {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.chats[chat].messages.is_empty() && self.chats[chat].pending.is_none()
-                        {
+                        let Some(project) = self.active() else {
+                            return;
+                        };
+                        let slot = &project.chats[chat];
+                        if slot.messages.is_empty() && slot.pending.is_none() {
                             ui.add_space(messages_h * 0.3);
                             ui.vertical_centered(|ui| {
                                 if has_model {
@@ -2766,7 +3173,7 @@ impl YeisonDock {
                                 }
                             });
                         }
-                        for message in &self.chats[chat].messages {
+                        for message in &slot.messages {
                             if message.role == MessageRole::Note {
                                 markdown::show(ui, &message.text, &Self::markdown_theme(message.role));
                             } else {
@@ -2774,13 +3181,13 @@ impl YeisonDock {
                             }
                             ui.add_space(6.0);
                         }
-                        if let Some(pending) = &self.chats[chat].pending {
+                        if let Some(pending) = &slot.pending {
                             let secs = pending.started.elapsed().as_secs();
                             if pending.text.trim().is_empty() {
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Spinner::new().size(12.0).color(palette::ACCENT));
-                                    let status = if !self.brain_progress.is_empty() {
-                                        self.brain_progress.clone()
+                                    let status = if !brain_progress.is_empty() {
+                                        brain_progress.clone()
                                     } else if pending.thinking {
                                         "Razonando…".into()
                                     } else {
@@ -2805,48 +3212,68 @@ impl YeisonDock {
                         }
                     });
 
+                let mut pick_model = false;
+                let mut cancel_reply = false;
+                let mut do_send = false;
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     if !has_model {
                         ui.vertical_centered(|ui| {
                             if Self::primary_button(ui, "Elegir modelo", true, true) {
-                                self.open_model_picker();
+                                pick_model = true;
                             }
                         });
                     } else {
+                        let busy = self
+                            .active()
+                            .and_then(|p| p.chats.get(chat))
+                            .is_some_and(|slot| slot.pending.is_some());
+                        let want_focus = self.focus_input && !busy;
                         ui.horizontal(|ui| {
-                            let busy = self.chats[chat].pending.is_some();
                             let button_w = 76.0;
-                            let text_edit = egui::TextEdit::singleline(&mut self.chats[chat].draft)
-                                .hint_text(if busy {
-                                    "Esperando respuesta…"
-                                } else {
-                                    "Escribí un mensaje…"
-                                })
-                                .margin(egui::vec2(10.0, 8.0))
-                                .desired_width(ui.available_width() - button_w - 8.0);
+                            let draft_w = ui.available_width() - button_w - 8.0;
+                            let Some(project) = self.active_mut() else {
+                                return;
+                            };
+                            let text_edit = egui::TextEdit::singleline(
+                                &mut project.chats[chat].draft,
+                            )
+                            .hint_text(if busy {
+                                "Esperando respuesta…"
+                            } else {
+                                "Escribí un mensaje…"
+                            })
+                            .margin(egui::vec2(10.0, 8.0))
+                            .desired_width(draft_w);
                             let response = ui.add_enabled(!busy, text_edit);
-                            if self.focus_input && !busy {
+                            if want_focus {
                                 response.request_focus();
-                                self.focus_input = false;
                             }
                             let enter = response.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let can_send = !busy && !project.chats[chat].draft.trim().is_empty();
 
                             if busy {
                                 if Self::danger_button(ui, "Cancelar") {
-                                    self.cancel_pending();
+                                    cancel_reply = true;
                                 }
-                            } else {
-                                let can_send = !self.chats[chat].draft.trim().is_empty();
-                                if Self::primary_button(ui, "Enviar", can_send, false)
-                                    || (enter && can_send)
-                                {
-                                    self.send_draft(ui.ctx());
-                                }
+                            } else if Self::primary_button(ui, "Enviar", can_send, false)
+                                || (enter && can_send)
+                            {
+                                do_send = true;
                             }
                         });
+                        if want_focus {
+                            self.focus_input = false;
+                        }
                     }
                 });
+                if pick_model {
+                    self.open_model_picker();
+                } else if cancel_reply {
+                    self.cancel_pending();
+                } else if do_send {
+                    self.send_draft(ui.ctx());
+                }
             });
         });
     }
@@ -2872,7 +3299,7 @@ impl eframe::App for YeisonDock {
         }
 
         // Archivos arrastrados sobre el dock alimentan el brain activo.
-        if self.active_project.is_some() {
+        if self.active().is_some() {
             let dropped: Vec<PathBuf> = ctx.input(|i| {
                 i.raw
                     .dropped_files

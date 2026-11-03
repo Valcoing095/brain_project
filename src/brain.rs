@@ -3156,6 +3156,108 @@ pub fn ingest_files(brain_dir: &Path, files: &[PathBuf]) -> Result<usize, String
     Ok(count)
 }
 
+/// Copia docs precargados del Brain origen al `context/` del destino.
+/// No llama a ninguna IA: sólo mueve markdown local para no quemar tokens.
+pub fn transfer_context(
+    from_name: &str,
+    from_brain: &Path,
+    to_brain: &Path,
+) -> Result<usize, String> {
+    if from_brain == to_brain {
+        return Err("Origen y destino son el mismo brain.".into());
+    }
+    if !from_brain.is_dir() {
+        return Err(format!(
+            "El brain de origen no existe: {}",
+            from_brain.display()
+        ));
+    }
+    fs::create_dir_all(to_brain)
+        .map_err(|e| format!("No se pudo crear el brain destino: {e}"))?;
+
+    let context_dir = to_brain.join("context");
+    fs::create_dir_all(&context_dir)
+        .map_err(|e| format!("No se pudo crear la carpeta context del brain: {e}"))?;
+
+    let prefix = format!("from_{}_", sanitize_transfer_name(from_name));
+    let docs = [
+        "00_overview.md",
+        BRAIN_INDEX,
+        "08_codebase_map.md",
+        "07_readme.md",
+    ];
+    let mut count = 0usize;
+    for name in docs {
+        let source = from_brain.join(name);
+        if !source.is_file() {
+            continue;
+        }
+        let base = format!("{prefix}{name}");
+        let target = unique_target(&context_dir, &base);
+        fs::copy(&source, &target)
+            .map_err(|e| format!("No se pudo copiar {}: {e}", source.display()))?;
+        count += 1;
+    }
+
+    if let Some(summary) = render_settled_transfer(from_name, from_brain) {
+        let base = format!("{prefix}settled_cards.md");
+        let target = unique_target(&context_dir, &base);
+        fs::write(&target, summary)
+            .map_err(|e| format!("No se pudo escribir las fichas transferidas: {e}"))?;
+        count += 1;
+    }
+
+    if count == 0 {
+        return Err(format!(
+            "El brain de `{from_name}` no tiene documentos para transferir. Escanealo primero."
+        ));
+    }
+
+    let document = render_extra_context(to_brain)?;
+    write_doc_if_changed(to_brain, "06_extra_context.md", &document)?;
+    Ok(count)
+}
+
+fn sanitize_transfer_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "proyecto".into()
+    } else {
+        trimmed.chars().take(40).collect()
+    }
+}
+
+fn render_settled_transfer(from_name: &str, from_brain: &Path) -> Option<String> {
+    let state = load_state(from_brain)?;
+    if state.settled.is_empty() {
+        return None;
+    }
+    let mut s = format!(
+        "# Fichas asentadas transferidas desde `{from_name}`\n\n\
+         Copia local del conocimiento ya asentado. No consume tokens. \
+         El código del proyecto destino manda sobre estas notas.\n\n"
+    );
+    let mut cards: Vec<_> = state.settled.iter().collect();
+    cards.sort_by(|a, b| b.1.hits.cmp(&a.1.hits).then_with(|| a.0.cmp(b.0)));
+    for (module, card) in cards.into_iter().take(24) {
+        s.push_str(&format!("## `{module}` (visto {} veces)\n\n", card.hits));
+        for line in card.lines.iter().take(12) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+    Some(truncate_bytes(&s, 12 * 1024))
+}
+
 fn read_extra_context(brain_dir: &Path) -> Option<String> {
     let content = fs::read_to_string(brain_dir.join("06_extra_context.md")).ok()?;
     if content.trim().is_empty() || content.contains("Todavía no se agregaron archivos") {
@@ -3912,6 +4014,80 @@ mod tests {
         assert!(helper_prompt.contains("fn helper"));
         assert!(helper_prompt.contains("2\n}\n"));
         assert!(!helper_prompt.contains("extra_helper"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn transfer_context_copia_docs_al_context_sin_ia() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yeison-transfer-{stamp}"));
+        let from_brain = root.join("from_brain");
+        let to_brain = root.join("to_brain");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&from_brain).unwrap();
+        fs::create_dir_all(&to_brain).unwrap();
+        fs::write(
+            from_brain.join("00_overview.md"),
+            "# Overview\n\nProyecto origen listo.\n",
+        )
+        .unwrap();
+        fs::write(
+            from_brain.join(BRAIN_INDEX),
+            "# Índice\n\n- módulo app\n",
+        )
+        .unwrap();
+        fs::write(
+            from_brain.join("08_codebase_map.md"),
+            "# Mapa\n\napp → util\n",
+        )
+        .unwrap();
+        let state = BrainState {
+            version: 1,
+            root: "/tmp/from".into(),
+            scanned_at_unix: 1,
+            dirs: 1,
+            total_bytes: 10,
+            truncated: false,
+            git: GitState::default(),
+            files: BTreeMap::new(),
+            recall: Recall {
+                consultations: 2,
+                terms: BTreeMap::new(),
+            },
+            settled: BTreeMap::from([(
+                "src/app".into(),
+                SettledCard {
+                    fingerprint: "abc".into(),
+                    lines: vec!["- `hello()` — saluda".into()],
+                    hits: 3,
+                },
+            )]),
+        };
+        save_state(&from_brain, &state).unwrap();
+
+        let count = transfer_context("Origen Demo", &from_brain, &to_brain).unwrap();
+        assert!(count >= 4, "count={count}");
+        let names: Vec<String> = fs::read_dir(to_brain.join("context"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("overview")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("settled_cards")),
+            "{names:?}"
+        );
+        let extra = fs::read_to_string(to_brain.join("06_extra_context.md")).unwrap();
+        assert!(extra.contains("Proyecto origen listo"), "{extra}");
+        assert!(extra.contains("hello()"), "{extra}");
+        assert!(transfer_context("Origen Demo", &from_brain, &from_brain).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }
