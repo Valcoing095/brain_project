@@ -1458,6 +1458,7 @@ dependencies = [
  "dirs",
  "display-info",
  "eframe",
+ "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "pulldown-cmark",
  "raw-window-handle",

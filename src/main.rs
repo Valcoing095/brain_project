@@ -8,6 +8,7 @@ mod brain;
 mod cursor_agent;
 mod macos_overlay;
 mod markdown;
+mod robot;
 mod native_picker;
 mod project;
 
@@ -28,13 +29,17 @@ const DOCK_WIDTH_CM: f32 = 8.5;
 const MAX_VISIBLE_TABS: usize = 5;
 const DOCK_HEIGHT_CM: f32 = 11.0;
 /// Espacio entre el borde superior del monitor y el panel del dock.
-const DOCK_MARGIN_TOP_CM: f32 = 1.0;
+/// Deja sitio para la isla del robot, justo debajo del notch.
+const DOCK_MARGIN_TOP_CM: f32 = 1.85;
 /// Altura de la franja superior que abre el dock (solo cuando está oculto).
 const HOT_ZONE_HEIGHT_CM: f32 = 1.0;
 /// Ancho de la franja: centrada, un poco más ancha que el panel para facilitar el apuntado.
 const HOT_ZONE_EXTRA_WIDTH_CM: f32 = 2.0;
 /// Tras abrir el panel, ignorar cierres por clic (macOS a veces no entrega el primer clic a egui).
 const OPEN_CLICK_GRACE: Duration = Duration::from_millis(450);
+const ISLAND_W: f32 = 92.0;
+const ISLAND_H: f32 = 46.0;
+const ISLAND_TITLE: &str = "Yeison Isla";
 
 // ---------- Paleta ----------
 mod palette {
@@ -289,6 +294,8 @@ struct YeisonDock {
     brain_scan_target: Option<PathBuf>,
     brain_status: Option<brain::BrainStatus>,
     session_sync_pending: bool,
+    robot_done_until: Option<Instant>,
+    robot_error_until: Option<Instant>,
 
     // Catálogo / escaneo
     catalog: AiCatalog,
@@ -355,6 +362,8 @@ impl YeisonDock {
             brain_scan_target: None,
             brain_status: None,
             session_sync_pending: false,
+            robot_done_until: None,
+            robot_error_until: None,
             catalog,
             catalog_scanning: false,
             scan_progress: String::new(),
@@ -997,6 +1006,7 @@ impl YeisonDock {
                             role: MessageRole::Assistant,
                             text,
                         });
+                        self.mark_robot_done();
                     }
                 }
                 UiEvent::ReplyFailed { seq, error } => {
@@ -1021,6 +1031,7 @@ impl YeisonDock {
                         role: MessageRole::Error,
                         text: error,
                     });
+                    self.mark_robot_error();
                 }
                 UiEvent::BrainProgress(text) => {
                     self.brain_progress = text;
@@ -1057,15 +1068,18 @@ impl YeisonDock {
                                     "sin Git".into()
                                 };
                                 self.notice = Some(format!("Índice al día. {git}."));
+                                self.mark_robot_done();
                             }
                         }
                         Ok(SyncOutcome::Updated(status, report)) => {
                             self.apply_brain_status(status);
                             self.notice = Some(format_sync_report(&report));
+                            self.mark_robot_done();
                         }
                         Err(error) => {
                             if error != "Escaneo cancelado." {
                                 self.notice = Some(error);
+                                self.mark_robot_error();
                             }
                         }
                     }
@@ -1113,6 +1127,146 @@ impl YeisonDock {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(logical_pos));
     }
 
+    fn mark_robot_done(&mut self) {
+        self.robot_done_until = Some(Instant::now() + Duration::from_millis(2800));
+        self.robot_error_until = None;
+    }
+
+    fn mark_robot_error(&mut self) {
+        self.robot_error_until = Some(Instant::now() + Duration::from_secs(6));
+        self.robot_done_until = None;
+    }
+
+    fn robot_mood(&self) -> robot::Mood {
+        let now = Instant::now();
+        let replying = self.chats.iter().any(|slot| slot.pending.is_some());
+        let streaming = self.chats.iter().any(|slot| {
+            slot.pending
+                .as_ref()
+                .is_some_and(|pending| !pending.text.trim().is_empty())
+        });
+        robot::resolve(robot::Signals {
+            replying,
+            streaming,
+            scanning: self.brain_scanning || self.catalog_scanning,
+            syncing: self.session_sync_pending
+                || (!self.brain_progress.is_empty() && !self.brain_scanning && !replying),
+            error: self.robot_error_until.is_some_and(|until| now < until),
+            stale: self.brain_status.as_ref().is_some_and(|status| status.stale),
+            just_done: self.robot_done_until.is_some_and(|until| now < until),
+        })
+    }
+
+    fn island_display(&self) -> Option<DisplayInfo> {
+        let displays = DisplayInfo::all().unwrap_or_default();
+        if displays.is_empty() {
+            return None;
+        }
+        let (mx, my) = Self::mouse_physical();
+        let idx = self
+            .display_idx
+            .or_else(|| display_index_at_mouse(&displays, mx, my))
+            .unwrap_or(0);
+        displays.get(idx.min(displays.len() - 1)).cloned()
+    }
+
+    fn island_logical(display: &DisplayInfo) -> (egui::Pos2, egui::Vec2) {
+        let scale = display.scale_factor.max(1.0);
+        let origin_y = if display.is_builtin { 20.0 } else { 4.0 };
+        let x = display.x as f32 / scale + (display.width as f32 / scale - ISLAND_W) * 0.5;
+        let y = display.y as f32 / scale + origin_y;
+        (egui::pos2(x, y), egui::vec2(ISLAND_W, ISLAND_H))
+    }
+
+    fn island_contains_mouse(&self, mx: f32, my: f32) -> bool {
+        let Some(display) = self.island_display() else {
+            return false;
+        };
+        let scale = display.scale_factor.max(1.0);
+        let (pos, size) = Self::island_logical(&display);
+        RectPhysical {
+            x: pos.x * scale,
+            y: pos.y * scale,
+            w: size.x * scale,
+            h: size.y * scale,
+        }
+        .contains(mx, my)
+    }
+
+    fn reveal_from_island(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(display) = self.island_display() else {
+            return;
+        };
+        let displays = DisplayInfo::all().unwrap_or_default();
+        let idx = displays.iter().position(|item| item.id == display.id).unwrap_or(0);
+        self.visible = true;
+        self.display_idx = Some(idx);
+        self.press_began_on_dock = true;
+        self.outside_click_enabled_after = Some(Instant::now() + OPEN_CLICK_GRACE);
+        if self.active_project.is_some() && self.chats.iter().any(|slot| slot.agent.is_some()) {
+            self.screen = DockScreen::Chat;
+            self.focus_input = true;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        self.apply_geometry(ctx, &display);
+        macos_overlay::sync_overlay_presence(frame, true);
+    }
+
+    fn show_island(&mut self, ctx: &egui::Context) -> bool {
+        let Some(display) = self.island_display() else {
+            return false;
+        };
+        let (pos, size) = Self::island_logical(&display);
+        let mood = self.robot_mood();
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("yeison-island"),
+            egui::ViewportBuilder::default()
+                .with_title(ISLAND_TITLE)
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_always_on_top()
+                .with_active(false)
+                .with_resizable(false)
+                .with_taskbar(false)
+                .with_visible(true)
+                .with_inner_size(size)
+                .with_min_inner_size(size)
+                .with_max_inner_size(size)
+                .with_position(pos),
+            |island_ctx, class| {
+                if class == egui::ViewportClass::Embedded {
+                    return false;
+                }
+                let mut clicked = false;
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(island_ctx, |ui| {
+                        let rect = ui.max_rect();
+                        let face = egui::Rect::from_center_size(rect.center(), egui::vec2(40.0, 36.0));
+                        let pill = face.expand(4.0);
+                        let painter = ui.painter();
+                        painter.rect_filled(pill, pill.height() * 0.5, egui::Color32::from_rgb(12, 13, 18));
+                        painter.rect_stroke(
+                            pill,
+                            pill.height() * 0.5,
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_premultiplied(255, 255, 255, 36)),
+                            egui::StrokeKind::Inside,
+                        );
+                        let time = ui.input(|input| input.time) as f32;
+                        robot::paint(painter, face, mood, time);
+                        let response = ui.interact(rect, egui::Id::new("yeison-island-hit"), egui::Sense::click());
+                        if response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        response.clone().on_hover_text(mood.label());
+                        clicked = response.clicked();
+                    });
+                island_ctx.request_repaint_after(Duration::from_millis(33));
+                clicked
+            },
+        )
+    }
+
     fn pointer_on_dock_ui(ctx: &egui::Context) -> bool {
         ctx.input(|i| {
             i.pointer.primary_down() || i.pointer.any_click() || i.pointer.interact_pos().is_some()
@@ -1158,6 +1312,11 @@ impl YeisonDock {
         } else if let Some(idx) = self.display_idx {
             self.apply_geometry(ctx, &displays[idx]);
             macos_overlay::sync_overlay_presence(frame, true);
+
+            // El clic en el robot no cuenta como un clic fuera del panel.
+            if self.island_contains_mouse(mx, my) {
+                self.press_began_on_dock = true;
+            }
 
             // Cerrar solo al soltar el clic fuera del panel (egui), no al presionar.
             let outside_clicks_enabled = self
@@ -2737,6 +2896,14 @@ impl eframe::App for YeisonDock {
             self.press_began_on_dock = false;
             self.outside_click_enabled_after = Some(Instant::now() + OPEN_CLICK_GRACE);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+
+        if !self.picker_open {
+            let clicked = self.show_island(ctx);
+            macos_overlay::raise_island_window();
+            if clicked {
+                self.reveal_from_island(ctx, frame);
+            }
         }
 
         if !self.visible {

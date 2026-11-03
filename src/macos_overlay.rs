@@ -57,8 +57,41 @@ pub fn sync_overlay_presence(frame: &eframe::Frame, visible: bool) {
     });
 }
 
+/// La isla del robot vive en otra ventana. La subimos al mismo nivel que el dock
+/// para que se vea dentro del notch y sobre las apps en pantalla completa.
+#[cfg(target_os = "macos")]
+pub fn raise_island_window() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSWindowCollectionBehavior};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let windows = app.windows();
+    for index in 0..windows.count() {
+        let window = windows.objectAtIndex(index);
+        if window.title().to_string() != "Yeison Isla" {
+            continue;
+        }
+        window.setLevel(SCREEN_SAVER_LEVEL);
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        window.setHidesOnDeactivate(false);
+        window.setIgnoresMouseEvents(false);
+        window.orderFront(None);
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn configure_for_fullscreen_overlay(_frame: &eframe::Frame) {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn sync_overlay_presence(_frame: &eframe::Frame, _visible: bool) {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn raise_island_window() {}
