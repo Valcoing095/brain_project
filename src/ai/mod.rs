@@ -7,4 +7,4 @@ pub use catalog::{
     ProviderEntry, ReadyState, ScanEvent,
 };
 pub use process::{new_cancel_flag, CancelFlag};
-pub use runtime::{init_workspace, send_message, AgentSelection, SessionState, StreamEvent};
+pub use runtime::{init_workspace, send_message, set_workspace, AgentSelection, SessionState, StreamEvent};

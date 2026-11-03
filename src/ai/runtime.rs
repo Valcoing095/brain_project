@@ -1,11 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use super::catalog::{ProviderEntry, ProviderKind};
 use super::process::{run_command, run_command_streaming, CancelFlag, AGENT_TIMEOUT};
 use crate::cursor_agent::AgentMode;
 
-static WORKSPACE: OnceLock<PathBuf> = OnceLock::new();
+static WORKSPACE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn workspace_slot() -> &'static RwLock<Option<PathBuf>> {
+    WORKSPACE.get_or_init(|| RwLock::new(None))
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentSelection {
@@ -57,14 +61,29 @@ pub enum StreamEvent {
 }
 
 pub fn init_workspace(default: PathBuf) {
-    let _ = WORKSPACE.set(default);
+    set_workspace(default);
+}
+
+/// Cambia la raíz del proyecto activo. Todos los agentes se ejecutan con este cwd.
+pub fn set_workspace(dir: PathBuf) {
+    let mut slot = workspace_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *slot = Some(dir);
 }
 
 pub fn workspace_dir() -> PathBuf {
-    WORKSPACE
-        .get()
-        .cloned()
-        .or_else(|| std::env::var("CURSOR_WORKSPACE").ok().map(PathBuf::from))
+    {
+        let slot = workspace_slot()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(dir) = slot.as_ref() {
+            return dir.clone();
+        }
+    }
+    std::env::var("CURSOR_WORKSPACE")
+        .ok()
+        .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
 }
