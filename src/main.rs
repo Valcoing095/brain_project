@@ -64,8 +64,10 @@ fn cm_to_px(cm: f32) -> f32 {
     (cm / 2.54) * DPI
 }
 
-fn cm_to_physical(cm: f32, scale: f32) -> f32 {
-    cm_to_px(cm) * scale
+/// Centro horizontal en el mismo espacio que el monitor.
+/// `span` y `item` van en puntos: en una Retina no se dividen por la escala.
+fn centered_x(origin_x: f32, span: f32, item: f32) -> f32 {
+    origin_x + (span - item) * 0.5
 }
 
 fn ago_label(unix: u64) -> String {
@@ -83,21 +85,25 @@ fn ago_label(unix: u64) -> String {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RectPhysical {
+struct ScreenRect {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
 }
 
-impl RectPhysical {
+impl ScreenRect {
     fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
 }
 
-fn display_bounds(display: &DisplayInfo) -> RectPhysical {
-    RectPhysical {
+/// `display-info` en macOS entrega `CGDisplayBounds`: puntos, origen arriba a la
+/// izquierda del monitor principal. egui coloca la ventana en ese mismo espacio.
+/// Dividir otra vez por `scale_factor` corre el dock y la isla al cuarto izquierdo
+/// de una pantalla Retina (como la del MacBook M4).
+fn display_bounds(display: &DisplayInfo) -> ScreenRect {
+    ScreenRect {
         x: display.x as f32,
         y: display.y as f32,
         w: display.width as f32,
@@ -105,24 +111,22 @@ fn display_bounds(display: &DisplayInfo) -> RectPhysical {
     }
 }
 
-fn dock_rect_for_display(display: &DisplayInfo) -> RectPhysical {
-    let scale = display.scale_factor;
-    let w = cm_to_physical(DOCK_WIDTH_CM, scale);
-    let h = cm_to_physical(DOCK_HEIGHT_CM, scale);
-    let margin = cm_to_physical(DOCK_MARGIN_TOP_CM, scale);
-    let x = display.x as f32 + (display.width as f32 - w) * 0.5;
+fn dock_rect_for_display(display: &DisplayInfo) -> ScreenRect {
+    let w = cm_to_px(DOCK_WIDTH_CM);
+    let h = cm_to_px(DOCK_HEIGHT_CM);
+    let margin = cm_to_px(DOCK_MARGIN_TOP_CM);
+    let x = centered_x(display.x as f32, display.width as f32, w);
     let y = display.y as f32 + margin;
-    RectPhysical { x, y, w, h }
+    ScreenRect { x, y, w, h }
 }
 
 /// Franja en el borde superior del monitor, centrada con el dock.
-fn hot_zone_rect_for_display(display: &DisplayInfo) -> RectPhysical {
-    let scale = display.scale_factor;
-    let zone_h = cm_to_physical(HOT_ZONE_HEIGHT_CM, scale);
-    let zone_w = cm_to_physical(DOCK_WIDTH_CM + HOT_ZONE_EXTRA_WIDTH_CM, scale);
-    let x = display.x as f32 + (display.width as f32 - zone_w) * 0.5;
+fn hot_zone_rect_for_display(display: &DisplayInfo) -> ScreenRect {
+    let zone_h = cm_to_px(HOT_ZONE_HEIGHT_CM);
+    let zone_w = cm_to_px(DOCK_WIDTH_CM + HOT_ZONE_EXTRA_WIDTH_CM);
+    let x = centered_x(display.x as f32, display.width as f32, zone_w);
     let y = display.y as f32;
-    RectPhysical {
+    ScreenRect {
         x,
         y,
         w: zone_w,
@@ -1100,20 +1104,20 @@ impl YeisonDock {
 
     // ----- Visibilidad / overlay -----
 
-    fn mouse_physical() -> (f32, f32) {
+    /// Posición del cursor en puntos de pantalla, el mismo espacio que `CGDisplayBounds`.
+    fn mouse_points() -> (f32, f32) {
         let (x, y) = Mouse::location();
         (x as f32, y as f32)
     }
 
     fn apply_geometry(&self, ctx: &egui::Context, display: &DisplayInfo) {
-        let scale = display.scale_factor;
         let panel = if self.expanded {
             display_bounds(display)
         } else {
             dock_rect_for_display(display)
         };
-        let logical_size = egui::vec2(panel.w / scale, panel.h / scale);
-        let logical_pos = egui::pos2(panel.x / scale, panel.y / scale);
+        let logical_size = egui::vec2(panel.w, panel.h);
+        let logical_pos = egui::pos2(panel.x, panel.y);
 
         // El tamaño inicial del viewport queda fijo al dock. Hay que soltar
         // ese tope antes de crecer a pantalla completa, y volver a fijarlo después.
@@ -1162,7 +1166,7 @@ impl YeisonDock {
         if displays.is_empty() {
             return None;
         }
-        let (mx, my) = Self::mouse_physical();
+        let (mx, my) = Self::mouse_points();
         let idx = self
             .display_idx
             .or_else(|| display_index_at_mouse(&displays, mx, my))
@@ -1171,10 +1175,9 @@ impl YeisonDock {
     }
 
     fn island_logical(display: &DisplayInfo) -> (egui::Pos2, egui::Vec2) {
-        let scale = display.scale_factor.max(1.0);
         let origin_y = if display.is_builtin { 20.0 } else { 4.0 };
-        let x = display.x as f32 / scale + (display.width as f32 / scale - ISLAND_W) * 0.5;
-        let y = display.y as f32 / scale + origin_y;
+        let x = centered_x(display.x as f32, display.width as f32, ISLAND_W);
+        let y = display.y as f32 + origin_y;
         (egui::pos2(x, y), egui::vec2(ISLAND_W, ISLAND_H))
     }
 
@@ -1182,13 +1185,12 @@ impl YeisonDock {
         let Some(display) = self.island_display() else {
             return false;
         };
-        let scale = display.scale_factor.max(1.0);
         let (pos, size) = Self::island_logical(&display);
-        RectPhysical {
-            x: pos.x * scale,
-            y: pos.y * scale,
-            w: size.x * scale,
-            h: size.y * scale,
+        ScreenRect {
+            x: pos.x,
+            y: pos.y,
+            w: size.x,
+            h: size.y,
         }
         .contains(mx, my)
     }
@@ -1284,7 +1286,7 @@ impl YeisonDock {
             return;
         }
 
-        let (mx, my) = Self::mouse_physical();
+        let (mx, my) = Self::mouse_points();
         let monitor = display_index_at_mouse(&displays, mx, my);
         let in_hot_zone = monitor.is_some_and(|idx| mouse_in_hot_zone(&displays[idx], mx, my));
 
@@ -2887,7 +2889,7 @@ impl eframe::App for YeisonDock {
         if self.reopen_after_picker {
             self.reopen_after_picker = false;
             let displays = DisplayInfo::all().unwrap_or_default();
-            let (mx, my) = Self::mouse_physical();
+            let (mx, my) = Self::mouse_points();
             let display = display_index_at_mouse(&displays, mx, my).or(self.display_idx);
             if !displays.is_empty() {
                 self.display_idx = Some(display.unwrap_or(0).min(displays.len() - 1));
@@ -3017,4 +3019,43 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(YeisonDock::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn el_centro_de_una_retina_no_cae_en_el_cuarto_izquierdo() {
+        // MacBook M4 en la resolución por defecto: 1512 puntos, escala 2.
+        // El notch está en el centro (756), no en 378.
+        let dock_w = cm_to_px(DOCK_WIDTH_CM);
+        let dock_x = centered_x(0.0, 1512.0, dock_w);
+        let dock_center = dock_x + dock_w * 0.5;
+        assert!((dock_center - 756.0).abs() < 0.5);
+        assert!((dock_center - 378.0).abs() > 100.0);
+
+        let island_x = centered_x(0.0, 1512.0, ISLAND_W);
+        let island_center = island_x + ISLAND_W * 0.5;
+        assert!((island_center - dock_center).abs() < 0.5);
+    }
+
+    #[test]
+    fn el_dock_y_la_isla_comparten_el_centro_de_cada_monitor() {
+        let Ok(displays) = DisplayInfo::all() else {
+            return;
+        };
+        for display in displays {
+            let screen_center = display.x as f32 + display.width as f32 * 0.5;
+            let dock = dock_rect_for_display(&display);
+            let dock_center = dock.x + dock.w * 0.5;
+            assert!(
+                (dock_center - screen_center).abs() < 1.0,
+                "dock {dock_center} vs pantalla {screen_center}"
+            );
+            let (pos, size) = YeisonDock::island_logical(&display);
+            let island_center = pos.x + size.x * 0.5;
+            assert!((island_center - screen_center).abs() < 1.0);
+        }
+    }
 }
