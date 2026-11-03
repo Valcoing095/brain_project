@@ -1170,7 +1170,15 @@ impl YeisonDock {
         } else {
             palette::OK
         };
-        (format!("{git}\n{when} · {freshness}"), color)
+        let learning = if status.consultations == 0 {
+            String::new()
+        } else {
+            format!(
+                " · {} consultas · {} fichas asentadas",
+                status.consultations, status.settled
+            )
+        };
+        (format!("{git}\n{when} · {freshness}{learning}"), color)
     }
 
     // ----- Pantalla: proyecto -----

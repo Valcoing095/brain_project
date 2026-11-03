@@ -189,6 +189,12 @@ pub struct Symbol {
     pub kind: String,
     pub name: String,
     pub line: usize,
+    /// Línea de la declaración, copiada del archivo.
+    #[serde(default)]
+    pub signature: String,
+    /// Comentario de documentación inmediatamente anterior, copiado del archivo.
+    #[serde(default)]
+    pub doc: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +206,12 @@ pub struct FileRecord {
     pub untracked: bool,
     pub symbols: Vec<Symbol>,
     pub imports: Vec<String>,
+    /// Comentario de módulo copiado del archivo (`//!`, `///` inicial o equivalente).
+    #[serde(default)]
+    pub doc: String,
+    /// Ya se extrajeron firmas y comentarios. Los índices viejos se completan al consultarlos.
+    #[serde(default)]
+    pub enriched: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -212,6 +224,25 @@ struct BrainState {
     truncated: bool,
     git: GitState,
     files: BTreeMap<String, FileRecord>,
+    /// Qué archivos respondieron cada término. Sirve para afinar la siguiente consulta.
+    #[serde(default)]
+    recall: Recall,
+    /// Fichas de módulo ancladas al tamaño y la fecha de sus archivos.
+    #[serde(default)]
+    settled: BTreeMap<String, SettledCard>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Recall {
+    consultations: u64,
+    terms: BTreeMap<String, BTreeMap<String, u32>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SettledCard {
+    fingerprint: String,
+    lines: Vec<String>,
+    hits: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +273,8 @@ pub struct BrainStatus {
     pub git: GitState,
     pub stale: bool,
     pub reason: String,
+    pub consultations: u64,
+    pub settled: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +320,8 @@ fn inspect_unlocked(root: &Path, brain_dir: &Path) -> BrainStatus {
         git: live.clone(),
         stale: true,
         reason: "sin índice inicial".into(),
+        consultations: 0,
+        settled: 0,
     };
     let Some(state) = state else {
         return status;
@@ -297,6 +332,8 @@ fn inspect_unlocked(root: &Path, brain_dir: &Path) -> BrainStatus {
     status.symbols = sum_symbols(&state.files);
     status.modules = unique_modules(&state.files);
     status.stack = detect_stack(root, &state.files);
+    status.consultations = state.recall.consultations;
+    status.settled = fresh_settled_count(&state);
     if state.version != BRAIN_VERSION {
         status.reason = "índice de una versión anterior; hace falta reconstruirlo".into();
         return status;
@@ -788,8 +825,21 @@ pub fn compose_prompt_live<F: FnMut(String)>(
     progress: F,
 ) -> (String, Result<SyncOutcome, String>) {
     let _guard = BRAIN_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-    let outcome = sync_session_locked(root, brain_dir, false, cancel, progress);
-    let state = load_state(brain_dir);
+    let mut outcome = sync_session_locked(root, brain_dir, false, cancel, progress);
+    let mut state = load_state(brain_dir);
+    if !cancel.load(Ordering::Relaxed) {
+        if let Some(state) = state.as_mut() {
+            settle_question(root, state, question);
+            let _ = save_state(brain_dir, state);
+            if let Ok(kind) = outcome.as_mut() {
+                let status = match kind {
+                    SyncOutcome::Unchanged(status) | SyncOutcome::Updated(status, _) => status,
+                };
+                status.consultations = state.recall.consultations;
+                status.settled = fresh_settled_count(state);
+            }
+        }
+    }
     let live_git = match outcome.as_ref() {
         Ok(SyncOutcome::Unchanged(status)) => status.git.clone(),
         Ok(SyncOutcome::Updated(status, _)) => status.git.clone(),
@@ -797,6 +847,271 @@ pub fn compose_prompt_live<F: FnMut(String)>(
     };
     let prompt = compose_prompt_from_state(name, root, brain_dir, state.as_ref(), &live_git, question);
     (prompt, outcome)
+}
+
+fn settle_question(root: &Path, state: &mut BrainState, question: &str) {
+    let keywords = keywords(question);
+    let mut ranked: Vec<(i32, String)> = state
+        .files
+        .iter()
+        .filter_map(|(rel, record)| {
+            let score = file_score(state, rel, record, &keywords);
+            (score > 0).then_some((score, rel.clone()))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.truncate(6);
+    let chosen: Vec<String> = ranked.into_iter().map(|(_, rel)| rel).collect();
+    for rel in &chosen {
+        enrich_file(root, state, rel);
+    }
+    prune_stale_cards(state);
+    let modules: BTreeSet<String> = chosen.iter().map(|rel| module_for(rel)).collect();
+    for module in &modules {
+        write_card(state, module);
+    }
+    remember(state, &keywords, &chosen);
+    state.recall.consultations = state.recall.consultations.saturating_add(1);
+}
+
+fn enrich_file(root: &Path, state: &mut BrainState, rel: &str) {
+    let Some(record) = state.files.get(rel).cloned() else {
+        return;
+    };
+    if record.enriched || !record.text || !is_code_like(rel) {
+        if let Some(slot) = state.files.get_mut(rel) {
+            slot.enriched = true;
+        }
+        return;
+    }
+    let Some(content) = read_text(&root.join(rel), MAX_ANALYZE_BYTES) else {
+        return;
+    };
+    let (symbols, imports, doc) = analyze_code(rel, &content);
+    if let Some(slot) = state.files.get_mut(rel) {
+        slot.symbols = symbols;
+        slot.imports = imports;
+        slot.doc = doc;
+        slot.enriched = true;
+    }
+}
+
+fn write_card(state: &mut BrainState, module: &str) {
+    let fingerprint = module_fingerprint(&state.files, module);
+    let lines = card_lines(&state.files, module);
+    if lines.is_empty() || fingerprint.is_empty() {
+        return;
+    }
+    if let Some(card) = state.settled.get_mut(module) {
+        if card.fingerprint == fingerprint && card.lines == lines {
+            card.hits = card.hits.saturating_add(1);
+        } else {
+            card.fingerprint = fingerprint;
+            card.lines = lines;
+            card.hits = 1;
+        }
+        return;
+    }
+    if state.settled.len() >= 80 {
+        let victim = state
+            .settled
+            .iter()
+            .min_by(|a, b| a.1.hits.cmp(&b.1.hits).then_with(|| a.0.cmp(b.0)))
+            .map(|(path, _)| path.clone());
+        if let Some(victim) = victim {
+            state.settled.remove(&victim);
+        }
+    }
+    state.settled.insert(
+        module.to_string(),
+        SettledCard {
+            fingerprint,
+            lines,
+            hits: 1,
+        },
+    );
+}
+
+fn card_lines(files: &BTreeMap<String, FileRecord>, module: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (rel, record) in files {
+        if module_for(rel) != module || !is_code_like(rel) {
+            continue;
+        }
+        if !record.doc.is_empty() && lines.len() < 12 {
+            lines.push(format!("`{rel}` — {}", record.doc));
+        }
+        for symbol in record.symbols.iter().take(8) {
+            if lines.len() >= 12 {
+                break;
+            }
+            let signature = if symbol.signature.is_empty() {
+                symbol.name.clone()
+            } else {
+                symbol.signature.clone()
+            };
+            if symbol.doc.is_empty() {
+                lines.push(format!("`{rel}` {} `{signature}`", symbol.kind));
+            } else {
+                lines.push(format!(
+                    "`{rel}` {} `{signature}` — {}",
+                    symbol.kind, symbol.doc
+                ));
+            }
+        }
+    }
+    lines
+}
+
+fn module_fingerprint(files: &BTreeMap<String, FileRecord>, module: &str) -> String {
+    let mut parts = Vec::new();
+    for (rel, record) in files {
+        if module_for(rel) == module && is_code_like(rel) {
+            parts.push(format!("{rel}:{}:{}", record.size, record.mtime_unix));
+        }
+    }
+    parts.sort();
+    parts.join("|")
+}
+
+fn prune_stale_cards(state: &mut BrainState) {
+    let stale: Vec<String> = state
+        .settled
+        .iter()
+        .filter(|(module, card)| card.fingerprint != module_fingerprint(&state.files, module))
+        .map(|(module, _)| module.clone())
+        .collect();
+    for module in stale {
+        state.settled.remove(&module);
+    }
+}
+
+fn fresh_settled_count(state: &BrainState) -> usize {
+    state
+        .settled
+        .iter()
+        .filter(|(module, card)| card.fingerprint == module_fingerprint(&state.files, module))
+        .count()
+}
+
+fn remember(state: &mut BrainState, keywords: &[String], files: &[String]) {
+    for term in keywords.iter().take(12) {
+        let paths = state.recall.terms.entry(term.clone()).or_default();
+        for rel in files.iter().take(4) {
+            let hits = paths.entry(rel.clone()).or_insert(0);
+            *hits = hits.saturating_add(1);
+        }
+        if paths.len() > 6 {
+            let mut ranked: Vec<(String, u32)> = paths.iter().map(|(path, hits)| (path.clone(), *hits)).collect();
+            ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
+            while paths.len() > 6 {
+                let Some((path, _)) = ranked.first().cloned() else {
+                    break;
+                };
+                paths.remove(&path);
+                ranked.remove(0);
+            }
+        }
+    }
+    if state.recall.terms.len() > 400 {
+        let mut ranked: Vec<(String, u32)> = state
+            .recall
+            .terms
+            .iter()
+            .map(|(term, paths)| (term.clone(), paths.values().copied().sum()))
+            .collect();
+        ranked.sort_by_key(|(_, hits)| *hits);
+        while state.recall.terms.len() > 400 {
+            let Some((term, _)) = ranked.first().cloned() else {
+                break;
+            };
+            state.recall.terms.remove(&term);
+            ranked.remove(0);
+        }
+    }
+}
+
+fn file_score(state: &BrainState, rel: &str, record: &FileRecord, keywords: &[String]) -> i32 {
+    let mut score = 0i32;
+    let mut recall = 0i32;
+    let lower_rel = rel.to_ascii_lowercase();
+    let file_doc = record.doc.to_ascii_lowercase();
+    for keyword in keywords {
+        if lower_rel.contains(keyword) {
+            score += 12;
+        }
+        if file_doc.contains(keyword) {
+            score += 5;
+        }
+        if record.symbols.iter().any(|symbol| {
+            symbol.name.to_ascii_lowercase().contains(keyword)
+                || symbol.signature.to_ascii_lowercase().contains(keyword)
+                || symbol.doc.to_ascii_lowercase().contains(keyword)
+        }) {
+            score += 7;
+        }
+        if record
+            .imports
+            .iter()
+            .any(|import| import.to_ascii_lowercase().contains(keyword))
+        {
+            score += 2;
+        }
+        if let Some(hits) = state.recall.terms.get(keyword).and_then(|paths| paths.get(rel)) {
+            recall += *hits as i32;
+        }
+    }
+    score + recall.min(15)
+}
+
+fn render_settled(state: &BrainState, question: &str) -> String {
+    let keywords = keywords(question);
+    let mut ranked: Vec<(i32, &str, &SettledCard)> = Vec::new();
+    for (module, card) in &state.settled {
+        if card.fingerprint != module_fingerprint(&state.files, module) {
+            continue;
+        }
+        let mut score = 0i32;
+        let module_l = module.to_ascii_lowercase();
+        let blob = card.lines.join("\n").to_ascii_lowercase();
+        for keyword in &keywords {
+            if module_l.contains(keyword) {
+                score += 8;
+            }
+            if blob.contains(keyword) {
+                score += 6;
+            }
+            if state.recall.terms.get(keyword).is_some_and(|paths| {
+                paths.keys().any(|path| module_for(path) == *module)
+            }) {
+                score += 4;
+            }
+        }
+        if score == 0 {
+            continue;
+        }
+        score += card.hits.min(10) as i32;
+        ranked.push((score, module.as_str(), card));
+    }
+    if ranked.is_empty() {
+        return String::new();
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let mut out = String::from(
+        "CONOCIMIENTO ASENTADO (firmas y comentarios copiados del código; sólo vale mientras el ancla del archivo siga igual):\n",
+    );
+    for (_, module, card) in ranked.into_iter().take(3) {
+        out.push_str(&format!(
+            "- `{module}` · visto {} {}\n",
+            card.hits,
+            if card.hits == 1 { "vez" } else { "veces" }
+        ));
+        for line in card.lines.iter().take(6) {
+            out.push_str(&format!("  - {line}\n"));
+        }
+    }
+    out.push('\n');
+    out
 }
 
 fn compose_prompt_from_state(
@@ -870,6 +1185,7 @@ fn compose_prompt_from_state(
             }
             pack.push_str("- `00_overview.md` es documentación general. No sustituye al código.\n");
             pack.push('\n');
+            pack.push_str(&render_settled(state, question));
 
             let sources = load_current_sources(root, state, question);
             if !sources.is_empty() {
@@ -899,7 +1215,7 @@ fn compose_prompt_from_state(
          REGLAS OBLIGATORIAS:\n\
          1. El código en disco es la fuente de verdad. El Brain es un índice incremental sincronizado con Git.\n\
          2. Nunca asumas que una descripción del Brain representa el comportamiento actual del código.\n\
-         3. El overview es documentación general. El detalle de un módulo se carga sólo cuando hace falta.\n\
+         3. El overview es documentación general. El bloque «CONOCIMIENTO ASENTADO» copia firmas y comentarios del código; si no coincide con «CÓDIGO ACTUAL», manda el código.\n\
          4. Antes de modificar un módulo, usá el bloque «CÓDIGO ACTUAL» si está. Si no alcanza, leé esos archivos y sus dependencias en `{root}`.\n\
          5. Si el working tree tiene cambios posteriores al índice, priorizá esos archivos.\n\
          6. Respondé SOLO con información verificable. Si un dato no está en el contexto ni en el código, decilo y pedí la fuente.\n\
@@ -916,27 +1232,7 @@ fn retrieve_relevant(state: &BrainState, question: &str) -> String {
     let mut scored: Vec<(i32, String)> = Vec::new();
 
     for (rel, record) in &state.files {
-        let mut score = 0i32;
-        let lower_rel = rel.to_ascii_lowercase();
-        for keyword in &keywords {
-            if lower_rel.contains(keyword) {
-                score += 12;
-            }
-            if record
-                .symbols
-                .iter()
-                .any(|symbol| symbol.name.to_ascii_lowercase().contains(keyword))
-            {
-                score += 7;
-            }
-            if record
-                .imports
-                .iter()
-                .any(|import| import.to_ascii_lowercase().contains(keyword))
-            {
-                score += 2;
-            }
-        }
+        let score = file_score(state, rel, record, &keywords);
         if score > 0 {
             scored.push((score, rel.clone()));
         }
@@ -1021,12 +1317,18 @@ fn load_current_sources(root: &Path, state: &BrainState, question: &str) -> Stri
             if rel_l.contains(keyword) {
                 score += 10;
             }
-            if record
-                .symbols
-                .iter()
-                .any(|symbol| symbol.name.to_ascii_lowercase().contains(keyword))
-            {
+            if record.symbols.iter().any(|symbol| {
+                let name = symbol.name.to_ascii_lowercase();
+                let signature = symbol.signature.to_ascii_lowercase();
+                let doc = symbol.doc.to_ascii_lowercase();
+                name.contains(keyword) || signature.contains(keyword) || doc.contains(keyword)
+            }) {
                 score += 7;
+            }
+            if state.recall.terms.get(keyword).is_some_and(|paths| {
+                paths.keys().any(|path| module_for(path) == module)
+            }) {
+                score += 4;
             }
         }
         if score > 0 {
@@ -1212,11 +1514,13 @@ fn analyze_file(
     let lang = lang_for(&meta.rel);
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
+    let mut doc = String::new();
     if meta.text && is_code_like(&meta.rel) {
         if let Some(content) = read_text(&root.join(&meta.rel), MAX_ANALYZE_BYTES) {
-            let (found_symbols, found_imports) = analyze_code(&meta.rel, &content);
+            let (found_symbols, found_imports, found_doc) = analyze_code(&meta.rel, &content);
             symbols = found_symbols;
             imports = found_imports;
+            doc = found_doc;
         }
     }
     Ok(FileRecord {
@@ -1227,10 +1531,12 @@ fn analyze_file(
         untracked,
         symbols,
         imports,
+        doc,
+        enriched: true,
     })
 }
 
-fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
+fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>, String) {
     let lang = lang_for(rel);
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
@@ -1238,15 +1544,37 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
     let mut impl_depth: Option<usize> = None;
     let mut depth = 0usize;
     let mut in_import_block = false;
+    let mut in_block_doc = false;
+    let mut pending_doc = String::new();
+    let mut file_doc = String::new();
+    let mut seen_code = false;
 
     for (index, raw) in content.lines().enumerate() {
         if symbols.len() >= MAX_SYMBOLS_PER_FILE && imports.len() >= MAX_IMPORTS_PER_FILE {
             break;
         }
         let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+        if line.is_empty() {
+            pending_doc.clear();
             continue;
         }
+        if let Some(text) = doc_comment_text(lang, line, &mut in_block_doc) {
+            if !text.is_empty() && pending_doc.len() < 360 {
+                pending_doc.push_str(&text);
+                pending_doc.push(' ');
+                if !seen_code && file_doc.len() < 360 {
+                    file_doc.push_str(&text);
+                    file_doc.push(' ');
+                }
+            }
+            continue;
+        }
+        if line.starts_with("//") || line.starts_with('#') || line.starts_with("/*") {
+            pending_doc.clear();
+            continue;
+        }
+        seen_code = true;
+        let symbols_before = symbols.len();
         let indentation = raw.len() - raw.trim_start().len();
         let line_no = index + 1;
 
@@ -1256,7 +1584,7 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                     push_import(&mut imports, line.trim_end_matches(';'));
                 } else if line.starts_with("mod ") {
                     if let Some(name) = ident_after(line, "mod ") {
-                        push_symbol(&mut symbols, "mod", &name, line_no);
+                        push_symbol(&mut symbols, "mod", &name, line_no, line, &mut pending_doc);
                     }
                 } else if line.starts_with("impl") {
                     impl_depth = Some(depth);
@@ -1267,13 +1595,13 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                         } else {
                             "fn"
                         };
-                        push_symbol(&mut symbols, kind, &name, line_no);
+                        push_symbol(&mut symbols, kind, &name, line_no, line, &mut pending_doc);
                     }
                 } else if let Some((kind, name)) = type_declaration(line) {
-                    push_symbol(&mut symbols, kind, &name, line_no);
+                    push_symbol(&mut symbols, kind, &name, line_no, line, &mut pending_doc);
                 } else if line.starts_with("macro_rules!") {
                     if let Some(name) = ident_after(line, "macro_rules!") {
-                        push_symbol(&mut symbols, "macro", &name, line_no);
+                        push_symbol(&mut symbols, "macro", &name, line_no, line, &mut pending_doc);
                     }
                 }
             }
@@ -1295,28 +1623,28 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                 }
                 if rest.starts_with("function ") {
                     if let Some(name) = function_name(rest) {
-                        push_symbol(&mut symbols, "function", &name, line_no);
+                        push_symbol(&mut symbols, "function", &name, line_no, line, &mut pending_doc);
                     }
                 } else if let Some(name) = ident_after(rest, "class ") {
-                    push_symbol(&mut symbols, "class", &name, line_no);
+                    push_symbol(&mut symbols, "class", &name, line_no, line, &mut pending_doc);
                     class_indent = Some(indentation);
                 } else if let Some(name) = ident_after(rest, "interface ") {
-                    push_symbol(&mut symbols, "interface", &name, line_no);
+                    push_symbol(&mut symbols, "interface", &name, line_no, line, &mut pending_doc);
                 } else if let Some(name) = ident_after(rest, "enum ") {
-                    push_symbol(&mut symbols, "enum", &name, line_no);
+                    push_symbol(&mut symbols, "enum", &name, line_no, line, &mut pending_doc);
                 } else if rest.starts_with("type ") {
                     if let Some(name) = ident_after(rest, "type ") {
-                        push_symbol(&mut symbols, "type", &name, line_no);
+                        push_symbol(&mut symbols, "type", &name, line_no, line, &mut pending_doc);
                     }
                 } else if rest.starts_with("const ") || rest.starts_with("let ") {
                     if let Some(name) = assignment_name(rest) {
                         if rest.contains("=>") || rest.contains("= function") || rest.contains("= async") {
-                            push_symbol(&mut symbols, "function", &name, line_no);
+                            push_symbol(&mut symbols, "function", &name, line_no, line, &mut pending_doc);
                         }
                     }
                 } else if class_indent.is_some_and(|base| indentation > base) {
                     if let Some(name) = method_name(rest) {
-                        push_symbol(&mut symbols, "method", &name, line_no);
+                        push_symbol(&mut symbols, "method", &name, line_no, line, &mut pending_doc);
                     }
                 }
             }
@@ -1328,7 +1656,7 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                         push_import(&mut imports, module.trim_start_matches("from "));
                     }
                 } else if let Some(name) = ident_after(line, "class ") {
-                    push_symbol(&mut symbols, "class", &name, line_no);
+                    push_symbol(&mut symbols, "class", &name, line_no, line, &mut pending_doc);
                     class_indent = Some(indentation);
                 } else if line.starts_with("def ") || line.starts_with("async def ") {
                     let rest = line.trim_start_matches("async ");
@@ -1338,7 +1666,7 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                         } else {
                             "function"
                         };
-                        push_symbol(&mut symbols, kind, &name, line_no);
+                        push_symbol(&mut symbols, kind, &name, line_no, line, &mut pending_doc);
                     }
                 }
             }
@@ -1371,11 +1699,11 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                         } else {
                             "function"
                         };
-                        push_symbol(&mut symbols, kind, &name, line_no);
+                        push_symbol(&mut symbols, kind, &name, line_no, line, &mut pending_doc);
                     }
                 } else if line.starts_with("type ") {
                     if let Some(name) = ident_after(line, "type ") {
-                        push_symbol(&mut symbols, "type", &name, line_no);
+                        push_symbol(&mut symbols, "type", &name, line_no, line, &mut pending_doc);
                     }
                 }
             }
@@ -1385,10 +1713,10 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                 } else if line.starts_with("import ") {
                     push_import(&mut imports, line.trim_start_matches("import "));
                 } else if let Some((kind, name)) = type_declaration(line) {
-                    push_symbol(&mut symbols, kind, &name, line_no);
+                    push_symbol(&mut symbols, kind, &name, line_no, line, &mut pending_doc);
                 } else if class_indent.is_some_and(|base| indentation > base) {
                     if let Some(name) = method_name(line) {
-                        push_symbol(&mut symbols, "method", &name, line_no);
+                        push_symbol(&mut symbols, "method", &name, line_no, line, &mut pending_doc);
                     }
                 }
                 if type_declaration(line).is_some() {
@@ -1402,15 +1730,18 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
                     }
                 }
                 if let Some((kind, name)) = type_declaration(line) {
-                    push_symbol(&mut symbols, kind, &name, line_no);
+                    push_symbol(&mut symbols, kind, &name, line_no, line, &mut pending_doc);
                     class_indent = Some(indentation);
                 } else if class_indent.is_some_and(|base| indentation > base) {
                     if let Some(name) = method_name(line) {
-                        push_symbol(&mut symbols, "method", &name, line_no);
+                        push_symbol(&mut symbols, "method", &name, line_no, line, &mut pending_doc);
                     }
                 }
             }
             _ => {}
+        }
+        if symbols.len() == symbols_before {
+            pending_doc.clear();
         }
 
         depth += raw.matches('{').count();
@@ -1429,7 +1760,7 @@ fn analyze_code(rel: &str, content: &str) -> (Vec<Symbol>, Vec<String>) {
         }
     }
 
-    (symbols, imports)
+    (symbols, imports, squash_text(&file_doc, 280))
 }
 
 fn function_name(line: &str) -> Option<String> {
@@ -1546,18 +1877,83 @@ fn require_import(line: &str) -> Option<String> {
     Some(value[..end].to_string())
 }
 
-fn push_symbol(symbols: &mut Vec<Symbol>, kind: &str, name: &str, line: usize) {
+fn push_symbol(
+    symbols: &mut Vec<Symbol>,
+    kind: &str,
+    name: &str,
+    line: usize,
+    source: &str,
+    doc: &mut String,
+) {
     if symbols.len() >= MAX_SYMBOLS_PER_FILE {
+        doc.clear();
         return;
     }
     if symbols.iter().any(|symbol| symbol.name == name && symbol.kind == kind) {
+        doc.clear();
         return;
     }
     symbols.push(Symbol {
         kind: kind.to_string(),
         name: name.to_string(),
         line,
+        signature: clean_signature(source),
+        doc: squash_text(doc, 220),
     });
+    doc.clear();
+}
+
+fn doc_comment_text(lang: &str, line: &str, in_block: &mut bool) -> Option<String> {
+    if *in_block {
+        if line.contains("*/") {
+            *in_block = false;
+        }
+        let cleaned = line
+            .trim()
+            .trim_start_matches('*')
+            .trim()
+            .trim_end_matches("*/")
+            .trim();
+        return Some(cleaned.to_string());
+    }
+    match lang {
+        "rust" => line
+            .strip_prefix("///")
+            .or_else(|| line.strip_prefix("//!"))
+            .map(|rest| rest.trim().to_string()),
+        "python" => line
+            .strip_prefix('#')
+            .filter(|rest| !rest.starts_with('!'))
+            .map(|rest| rest.trim().to_string()),
+        "javascript" | "typescript" | "tsx" | "jsx" | "java" | "kotlin" | "go" => {
+            if line.starts_with("/**") {
+                *in_block = !line.contains("*/");
+                let cleaned = line
+                    .trim_start_matches('/')
+                    .trim_matches('*')
+                    .trim()
+                    .trim_end_matches("*/")
+                    .trim();
+                Some(cleaned.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn clean_signature(line: &str) -> String {
+    let trimmed = line.trim().trim_end_matches('{').trim().trim_end_matches(':').trim();
+    squash_text(&trimmed.to_string(), 180)
+}
+
+fn squash_text(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    flat.chars().take(max_chars).collect::<String>() + "…"
 }
 
 fn push_import(imports: &mut Vec<String>, value: &str) {
@@ -2209,6 +2605,12 @@ fn render_module_doc(module: &ModuleRecord, files: &BTreeMap<String, FileRecord>
                 "- {} `{}` (línea {})\n",
                 symbol.kind, symbol.name, symbol.line
             ));
+            if !symbol.signature.is_empty() {
+                s.push_str(&format!("  - `{}`\n", symbol.signature));
+            }
+            if !symbol.doc.is_empty() {
+                s.push_str(&format!("  - {}\n", symbol.doc));
+            }
         }
         if !record.imports.is_empty() {
             let imports = record
@@ -3289,6 +3691,57 @@ mod tests {
         assert!(should_reread(true, false, false, true));
         assert!(should_reread(false, true, true, false));
         assert!(!should_reread(true, false, false, false));
+    }
+
+    #[test]
+    fn guarda_la_firma_y_el_comentario_tal_cual_estan_en_el_archivo() {
+        let (symbols, _, doc) = analyze_code(
+            "src/app/mod.rs",
+            "//! Modulo de saludo.\n\n/// Devuelve el saludo del proyecto.\npub fn hello() -> i32 {\n    1\n}\n",
+        );
+        assert!(doc.contains("Modulo de saludo"), "{doc}");
+        let hello = symbols.iter().find(|symbol| symbol.name == "hello").unwrap();
+        assert!(hello.signature.contains("pub fn hello() -> i32"), "{}", hello.signature);
+        assert!(hello.doc.contains("Devuelve el saludo del proyecto"), "{}", hello.doc);
+    }
+
+    #[test]
+    fn la_ficha_se_afina_con_las_consultas_y_cae_si_el_archivo_cambia() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yeison-learn-{stamp}"));
+        let brain = root.join("brain_test");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        let app = root.join("src/app/mod.rs");
+        fs::write(
+            &app,
+            "/// Devuelve el saludo del proyecto.\npub fn hello() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        let (first, _) = compose_prompt_live("demo", &root, &brain, "qué hace hello", &cancel(), quiet);
+        assert!(first.contains("CONOCIMIENTO ASENTADO"), "{first}");
+        assert!(first.contains("Devuelve el saludo del proyecto"), "{first}");
+        assert!(first.contains("pub fn hello() -> i32"), "{first}");
+
+        let (second, _) = compose_prompt_live("demo", &root, &brain, "hello de nuevo", &cancel(), quiet);
+        assert!(second.contains("visto 2 veces"), "{second}");
+        assert_eq!(load_state(&brain).unwrap().recall.consultations, 2);
+
+        fs::write(
+            &app,
+            "/// Ahora cuenta visitas.\npub fn hello() -> i32 {\n    40\n}\n\npub fn visits() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let (third, _) = compose_prompt_live("demo", &root, &brain, "qué hace hello", &cancel(), quiet);
+        assert!(third.contains("Ahora cuenta visitas"), "{third}");
+        assert!(third.contains("fn visits"), "{third}");
+        assert!(!third.contains("Devuelve el saludo del proyecto"), "{third}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
