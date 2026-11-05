@@ -5,7 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod ai;
 mod brain;
+mod brief;
 mod cursor_agent;
+mod edits;
 mod macos_overlay;
 mod markdown;
 mod plan;
@@ -19,7 +21,9 @@ use ai::{
     CancelFlag, ProviderEntry, ReadyState, ScanEvent, SessionState, StreamEvent,
 };
 use brain::{BrainReport, ProgressTick, SyncMode, SyncOutcome};
+use brief::ChatBrief;
 use cursor_agent::AgentMode;
+use edits::FileChange;
 use display_info::DisplayInfo;
 use eframe::egui;
 use plan::WorkPlan;
@@ -98,6 +102,45 @@ fn short_path(path: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
+fn one_line_tail(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = flat.chars().count();
+    if count <= max_chars {
+        return flat;
+    }
+    let skip = count - max_chars + 1;
+    let mut out: String = flat.chars().skip(skip).collect();
+    out.insert(0, '…');
+    out
+}
+
+fn note_live_preview(pending: &mut PendingReply) {
+    let Some(live) = edits::streaming_preview(&pending.text) else {
+        if pending.work.source != WorkSource::Code {
+            pending.work.source = WorkSource::Tokens;
+            pending.work.label = "Generando respuesta…".into();
+        }
+        return;
+    };
+    if !pending.touched.iter().any(|item| item == &live.path) {
+        pending.touched.push(live.path.clone());
+    }
+    if !live.open && pending.work.source == WorkSource::Code && pending.work.preview.is_some() {
+        return;
+    }
+    let short = short_path(&live.path, 36);
+    pending.work.source = WorkSource::Code;
+    pending.work.label = if live.open {
+        format!("Escribiendo {short}")
+    } else {
+        format!("Archivo listo · {short}")
+    };
+    pending.work.file = Some(live.path);
+    if !live.preview.trim().is_empty() {
+        pending.work.preview = Some(live.preview);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ScreenRect {
     x: f32,
@@ -174,6 +217,25 @@ enum MessageRole {
 struct ChatMessage {
     role: MessageRole,
     text: String,
+    changes: Vec<FileChange>,
+}
+
+impl ChatMessage {
+    fn new(role: MessageRole, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            text: text.into(),
+            changes: Vec::new(),
+        }
+    }
+
+    fn with_changes(role: MessageRole, text: impl Into<String>, changes: Vec<FileChange>) -> Self {
+        Self {
+            role,
+            text: text.into(),
+            changes,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,8 +243,16 @@ enum DockScreen {
     PickProject,
     PickProvider,
     PickModel,
+    /// Reglas del chat: qué no hacer, qué hacer sí o sí y qué tener en cuenta.
+    Brief,
     Chat,
     Plan,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BriefNext {
+    Enter,
+    ReturnToChat,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -230,11 +300,24 @@ enum UiEvent {
     ScanProgress(String),
     ScanProvider(ProviderEntry),
     ScanFinished,
-    ReplyThinking { seq: u64 },
+    ReplyThinking { seq: u64, text: String },
     ReplyDelta { seq: u64, text: String },
     ReplyReplace { seq: u64, text: String },
-    ReplyDone { seq: u64, text: String, session: SessionState },
-    ReplyFailed { seq: u64, error: String },
+    ReplyDone {
+        seq: u64,
+        text: String,
+        session: SessionState,
+        changes: Vec<FileChange>,
+    },
+    ReplyActivity {
+        seq: u64,
+        activity: edits::Activity,
+    },
+    ReplyFailed {
+        seq: u64,
+        error: String,
+        changes: Vec<FileChange>,
+    },
     WorkUpdate {
         seq: u64,
         source: WorkSource,
@@ -263,6 +346,7 @@ enum UiEvent {
 enum WorkSource {
     Brain,
     Tokens,
+    Code,
 }
 
 impl WorkSource {
@@ -270,6 +354,7 @@ impl WorkSource {
         match self {
             WorkSource::Brain => "Brain",
             WorkSource::Tokens => "Tokens",
+            WorkSource::Code => "Código",
         }
     }
 }
@@ -283,6 +368,7 @@ struct WorkMeter {
     brain_tokens: u32,
     prompt_tokens: u32,
     output_tokens: u32,
+    preview: Option<String>,
 }
 
 impl WorkMeter {
@@ -294,6 +380,7 @@ impl WorkMeter {
             brain_tokens: 0,
             prompt_tokens: 0,
             output_tokens: 0,
+            preview: None,
         }
     }
 }
@@ -308,6 +395,10 @@ struct PendingReply {
     kind: ReplyKind,
     /// Pedido original del usuario (para titular el plan).
     goal_hint: String,
+    /// Archivos que la IA fue tocando en este turno.
+    touched: Vec<String>,
+    /// Pensamiento en curso, para mostrar que sigue trabajando.
+    thought: String,
 }
 
 /// Un chat vivo. Los dos slots siguen recibiendo respuestas aunque mires el otro.
@@ -317,6 +408,7 @@ struct ChatSlot {
     session: SessionState,
     agent: Option<AgentSelection>,
     pending: Option<PendingReply>,
+    brief: ChatBrief,
 }
 
 impl ChatSlot {
@@ -327,6 +419,7 @@ impl ChatSlot {
             session: SessionState::Empty,
             agent: None,
             pending: None,
+            brief: ChatBrief::fresh(),
         }
     }
 
@@ -434,6 +527,8 @@ struct YeisonDock {
     plan_generate_after_pick: bool,
     /// Tras elegir modelo/agente, desarrollar este plan.
     develop_plan_id: Option<String>,
+    brief_draft: Option<ChatBrief>,
+    brief_next: BriefNext,
 
     expanded: bool,
     focus_input: bool,
@@ -492,6 +587,8 @@ impl YeisonDock {
             model_pick_from_chat: false,
             plan_generate_after_pick: false,
             develop_plan_id: None,
+            brief_draft: None,
+            brief_next: BriefNext::Enter,
             expanded: false,
             focus_input: false,
             reply_gen: 0,
@@ -966,9 +1063,9 @@ impl YeisonDock {
             return;
         }
 
-        let develop_id = self.develop_plan_id.clone();
+        let develop_id = self.develop_plan_id.is_some();
         let generate_plan = self.plan_generate_after_pick;
-        let cursor_mode = if develop_id.is_some() {
+        let cursor_mode = if develop_id {
             provider
                 .kind
                 .supports_cursor_modes()
@@ -990,9 +1087,23 @@ impl YeisonDock {
             cursor_mode,
         });
         self.model_pick_from_chat = false;
+
+        let confirmed = self
+            .active()
+            .and_then(|project| project.chats.get(project.active_chat))
+            .is_some_and(|slot| slot.brief.confirmed);
+        if !confirmed {
+            self.open_brief(BriefNext::Enter);
+            return;
+        }
+        self.finish_after_model(ctx);
+    }
+
+    fn finish_after_model(&mut self, ctx: &egui::Context) {
+        let develop_id = self.develop_plan_id.clone();
+        let generate_plan = self.plan_generate_after_pick;
         self.plan_generate_after_pick = false;
         self.develop_plan_id = None;
-
         if let Some(plan_id) = develop_id {
             self.begin_develop_plan(ctx, &plan_id);
             return;
@@ -1003,6 +1114,72 @@ impl YeisonDock {
         }
         self.screen = DockScreen::Chat;
         self.focus_input = true;
+    }
+
+    fn open_brief(&mut self, next: BriefNext) {
+        let Some(project) = self.active() else {
+            return;
+        };
+        let mut draft = project.chats[project.active_chat].brief.clone();
+        if !draft.seeded {
+            draft.write_code = self.develop_plan_id.is_some() || self.picker_mode == AgentMode::Agent;
+            draft.seeded = true;
+        }
+        self.brief_draft = Some(draft);
+        self.brief_next = next;
+        self.screen = DockScreen::Brief;
+    }
+
+    fn confirm_brief(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.brief_draft.take() else {
+            self.screen = DockScreen::Chat;
+            return;
+        };
+        draft.confirmed = true;
+        draft.seeded = true;
+        let next = self.brief_next;
+        if let Some(project) = self.active_mut() {
+            project.chats[project.active_chat].brief = draft;
+        }
+        self.sync_cursor_mode_from_brief();
+        match next {
+            BriefNext::Enter => self.finish_after_model(ctx),
+            BriefNext::ReturnToChat => {
+                self.screen = DockScreen::Chat;
+                self.focus_input = true;
+                self.notice = Some(
+                    "Reglas listas. Las voy a tener en cuenta en este chat.".into(),
+                );
+            }
+        }
+    }
+
+    fn sync_cursor_mode_from_brief(&mut self) {
+        let Some(project) = self.active() else {
+            return;
+        };
+        let index = project.active_chat;
+        let Some(agent) = project.chats[index].agent.as_ref() else {
+            return;
+        };
+        if !agent.provider.kind.supports_cursor_modes() {
+            return;
+        }
+        let write = project.chats[index].brief.write_code;
+        let current = agent.cursor_mode.unwrap_or(AgentMode::Ask);
+        let mode = if self.plan_generate_after_pick {
+            AgentMode::Plan
+        } else if write {
+            AgentMode::Agent
+        } else if current == AgentMode::Plan {
+            AgentMode::Plan
+        } else {
+            AgentMode::Ask
+        };
+        let project = self.active_mut().unwrap();
+        if let Some(agent) = project.chats[index].agent.as_mut() {
+            agent.cursor_mode = Some(mode);
+        }
     }
 
     /// Pide un plan de trabajo con el borrador (o un texto guía).
@@ -1064,10 +1241,15 @@ impl YeisonDock {
         }
         let prompt = plan.develop_prompt();
         let title = plan.title.clone();
+        let write_code = project.chats[project.active_chat].brief.write_code;
         let project = self.active_mut().unwrap();
         if let Some(agent) = project.chats[project.active_chat].agent.as_mut() {
             if agent.provider.kind.supports_cursor_modes() {
-                agent.cursor_mode = Some(AgentMode::Agent);
+                agent.cursor_mode = Some(if write_code {
+                    AgentMode::Agent
+                } else {
+                    AgentMode::Ask
+                });
             }
         }
         project.chats[project.active_chat].draft = prompt;
@@ -1114,10 +1296,10 @@ impl YeisonDock {
         let provider_name = selection.provider.display_name.clone();
         project.chats[index].agent = Some(selection);
         if had_history {
-            project.chats[index].messages.push(ChatMessage {
-                role: MessageRole::Note,
-                text: format!("Sesión nueva con {provider_name} · {label}."),
-            });
+        project.chats[index].messages.push(ChatMessage::new(
+            MessageRole::Note,
+            format!("Sesión nueva con {provider_name} · {label}."),
+        ));
         }
     }
 
@@ -1204,15 +1386,15 @@ impl YeisonDock {
         if let Some(pending) = slot.pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
             if !pending.text.trim().is_empty() {
-                slot.messages.push(ChatMessage {
-                    role: MessageRole::Assistant,
-                    text: format!("{}\n\n(respuesta cancelada)", pending.text.trim_end()),
-                });
+                slot.messages.push(ChatMessage::new(
+                    MessageRole::Assistant,
+                    format!("{}\n\n(respuesta cancelada)", pending.text.trim_end()),
+                ));
             } else {
-                slot.messages.push(ChatMessage {
-                    role: MessageRole::Error,
-                    text: "Respuesta cancelada.".into(),
-                });
+                slot.messages.push(ChatMessage::new(
+                    MessageRole::Error,
+                    "Respuesta cancelada.",
+                ));
             }
         }
     }
@@ -1264,10 +1446,7 @@ impl YeisonDock {
         set_workspace(entry.root.clone());
 
         let project = self.active_mut().unwrap();
-        project.chats[index].messages.push(ChatMessage {
-            role: MessageRole::User,
-            text: text.clone(),
-        });
+        project.chats[index].messages.push(ChatMessage::new(MessageRole::User, text.clone()));
         project.chats[index].draft.clear();
         self.focus_input = true;
 
@@ -1289,7 +1468,11 @@ impl YeisonDock {
             work: WorkMeter::starting(),
             kind,
             goal_hint: hint,
+            touched: Vec::new(),
+            thought: String::new(),
         });
+        let brief = project.chats[index].brief.clone();
+        let is_plan = kind == ReplyKind::Plan;
         let mut session = project.chats[index].session.clone();
         let tx = self.ui_tx.clone();
         let ctx_clone = ctx.clone();
@@ -1356,10 +1539,13 @@ impl YeisonDock {
                 let _ = tx.send(UiEvent::ReplyFailed {
                     seq,
                     error: "Cancelado.".into(),
+                    changes: Vec::new(),
                 });
                 ctx_clone.request_repaint();
                 return;
             }
+            let before = edits::snapshot(&entry.root);
+            let prompt = brief.decorate(&prompt, is_plan);
             let prompt_tokens = brain::estimate_tokens(&prompt);
             let _ = tx.send(UiEvent::WorkUpdate {
                 seq,
@@ -1374,9 +1560,10 @@ impl YeisonDock {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 send_message(&selection, &mut session, &prompt, &cancel, |event| {
                     let ui_event = match event {
-                        StreamEvent::Thinking => UiEvent::ReplyThinking { seq },
+                        StreamEvent::Thinking { text } => UiEvent::ReplyThinking { seq, text },
                         StreamEvent::Delta(t) => UiEvent::ReplyDelta { seq, text: t },
                         StreamEvent::Replace(t) => UiEvent::ReplyReplace { seq, text: t },
+                        StreamEvent::Activity(activity) => UiEvent::ReplyActivity { seq, activity },
                     };
                     let _ = tx_events.send(ui_event);
                     ctx_events.request_repaint();
@@ -1384,19 +1571,35 @@ impl YeisonDock {
             }));
             match result {
                 Ok(Ok(reply)) => {
+                    let changes = if is_plan {
+                        Vec::new()
+                    } else {
+                        edits::finish_turn(&entry.root, &before, &reply, brief.write_code)
+                    };
                     let _ = tx.send(UiEvent::ReplyDone {
                         seq,
                         text: reply,
                         session,
+                        changes,
                     });
                 }
                 Ok(Err(error)) => {
-                    let _ = tx.send(UiEvent::ReplyFailed { seq, error });
+                    let changes = if is_plan {
+                        Vec::new()
+                    } else {
+                        edits::finish_turn(&entry.root, &before, "", brief.write_code)
+                    };
+                    let _ = tx.send(UiEvent::ReplyFailed {
+                        seq,
+                        error,
+                        changes,
+                    });
                 }
                 Err(_) => {
                     let _ = tx.send(UiEvent::ReplyFailed {
                         seq,
                         error: "Fallo interno al ejecutar el agente.".into(),
+                        changes: Vec::new(),
                     });
                 }
             }
@@ -1430,11 +1633,17 @@ impl YeisonDock {
                         self.finish_scan();
                     }
                 }
-                UiEvent::ReplyThinking { seq } => {
+                UiEvent::ReplyThinking { seq, text } => {
                     if let Some(pending) = self.pending_mut(seq) {
                         pending.thinking = true;
                         pending.work.source = WorkSource::Tokens;
-                        if pending.work.label.is_empty()
+                        if !text.is_empty() {
+                            pending.thought.push_str(&text);
+                            pending.work.label = format!(
+                                "Razonando: {}",
+                                one_line_tail(&pending.thought, 88)
+                            );
+                        } else if pending.work.label.is_empty()
                             || pending.work.label.starts_with("Enviando")
                         {
                             pending.work.label = "Razonando…".into();
@@ -1445,20 +1654,36 @@ impl YeisonDock {
                     if let Some(pending) = self.pending_mut(seq) {
                         pending.thinking = false;
                         pending.text.push_str(&text);
-                        pending.work.source = WorkSource::Tokens;
-                        pending.work.label = "Generando respuesta…".into();
-                        pending.work.file = None;
                         pending.work.output_tokens = brain::estimate_tokens(&pending.text);
+                        note_live_preview(pending);
                     }
                 }
                 UiEvent::ReplyReplace { seq, text } => {
                     if let Some(pending) = self.pending_mut(seq) {
                         pending.thinking = false;
                         pending.text = text;
-                        pending.work.source = WorkSource::Tokens;
-                        pending.work.label = "Generando respuesta…".into();
-                        pending.work.file = None;
                         pending.work.output_tokens = brain::estimate_tokens(&pending.text);
+                        note_live_preview(pending);
+                    }
+                }
+                UiEvent::ReplyActivity { seq, activity } => {
+                    if let Some(pending) = self.pending_mut(seq) {
+                        pending.thinking = false;
+                        pending.work.source = WorkSource::Code;
+                        pending.work.label = activity.label;
+                        if let Some(file) = activity.file.clone() {
+                            pending.work.file = Some(file.clone());
+                            if !pending.touched.iter().any(|item| item == &file) {
+                                pending.touched.push(file);
+                            }
+                        }
+                        if activity
+                            .preview
+                            .as_ref()
+                            .is_some_and(|preview| !preview.trim().is_empty())
+                        {
+                            pending.work.preview = activity.preview;
+                        }
                     }
                 }
                 UiEvent::WorkUpdate {
@@ -1487,7 +1712,12 @@ impl YeisonDock {
                         }
                     }
                 }
-                UiEvent::ReplyDone { seq, text, session } => {
+                UiEvent::ReplyDone {
+                    seq,
+                    text,
+                    session,
+                    changes,
+                } => {
                     if let Some((open_idx, chat_idx)) = self.chat_loc_for_seq(seq) {
                         let pending = self.open_projects[open_idx].chats[chat_idx].pending.take();
                         let (kind, goal_hint) = pending
@@ -1495,10 +1725,11 @@ impl YeisonDock {
                             .unwrap_or((ReplyKind::Chat, String::new()));
                         let chat = &mut self.open_projects[open_idx].chats[chat_idx];
                         chat.session = session;
-                        chat.messages.push(ChatMessage {
-                            role: MessageRole::Assistant,
-                            text: text.clone(),
-                        });
+                        chat.messages.push(ChatMessage::with_changes(
+                            MessageRole::Assistant,
+                            text.clone(),
+                            changes,
+                        ));
                         self.mark_robot_done();
                         if kind == ReplyKind::Plan {
                             let plan = WorkPlan::from_markdown(&goal_hint, &text);
@@ -1514,7 +1745,11 @@ impl YeisonDock {
                         }
                     }
                 }
-                UiEvent::ReplyFailed { seq, error } => {
+                UiEvent::ReplyFailed {
+                    seq,
+                    error,
+                    changes,
+                } => {
                     let Some((open_idx, chat_idx)) = self.chat_loc_for_seq(seq) else {
                         continue;
                     };
@@ -1527,16 +1762,15 @@ impl YeisonDock {
                     if error == "Cancelado." {
                         continue;
                     }
-                    if !partial.trim().is_empty() {
-                        chat.messages.push(ChatMessage {
-                            role: MessageRole::Assistant,
-                            text: partial,
-                        });
+                    if !partial.trim().is_empty() || !changes.is_empty() {
+                        chat.messages.push(ChatMessage::with_changes(
+                            MessageRole::Assistant,
+                            partial,
+                            changes,
+                        ));
                     }
-                    chat.messages.push(ChatMessage {
-                        role: MessageRole::Error,
-                        text: error,
-                    });
+                    chat.messages
+                        .push(ChatMessage::new(MessageRole::Error, error));
                     self.mark_robot_error();
                 }
                 UiEvent::BrainProgress { brain_dir, text } => {
@@ -3090,6 +3324,292 @@ impl YeisonDock {
         });
     }
 
+    fn toggle_chip(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+        let button = egui::Button::new(
+            egui::RichText::new(label).size(11.0).color(if on {
+                egui::Color32::WHITE
+            } else {
+                palette::TEXT
+            }),
+        )
+        .fill(if on { palette::ACCENT } else { palette::CARD })
+        .corner_radius(8.0)
+        .min_size(egui::vec2(0.0, 26.0));
+        let response = ui.add(button);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        response.clicked()
+    }
+
+    fn show_changes(ui: &mut egui::Ui, changes: &[FileChange], max_w: f32) {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_max_width(max_w);
+            egui::Frame::new()
+                .fill(palette::CARD)
+                .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let title = if changes.len() == 1 {
+                        "1 cambio en el proyecto".to_string()
+                    } else {
+                        format!("{} cambios en el proyecto", changes.len())
+                    };
+                    ui.label(
+                        egui::RichText::new(title)
+                            .strong()
+                            .size(11.5)
+                            .color(palette::TEXT),
+                    );
+                    ui.add_space(4.0);
+                    for change in changes.iter().take(6) {
+                        let color = match change.kind {
+                            edits::ChangeKind::Added => palette::OK,
+                            edits::ChangeKind::Modified => palette::ACCENT,
+                            edits::ChangeKind::Deleted => palette::DANGER,
+                        };
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                egui::RichText::new(change.kind.mark())
+                                    .monospace()
+                                    .strong()
+                                    .size(12.0)
+                                    .color(color),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{} · {}",
+                                        short_path(&change.path, 34),
+                                        change.kind.label()
+                                    ))
+                                    .size(10.5)
+                                    .color(palette::TEXT),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    }
+                    if changes.len() > 6 {
+                        ui.label(
+                            egui::RichText::new(format!("y {} más", changes.len() - 6))
+                                .size(10.0)
+                                .color(palette::TEXT_MUTED),
+                        );
+                    }
+                    if let Some(sample) = changes.iter().find(|change| !change.preview.trim().is_empty())
+                    {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Vista · {}",
+                                short_path(&sample.path, 32)
+                            ))
+                            .size(9.5)
+                            .color(palette::TEXT_MUTED),
+                        );
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(24, 25, 32))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(&sample.preview)
+                                        .monospace()
+                                        .size(9.5)
+                                        .color(palette::TEXT),
+                                );
+                            });
+                    }
+                });
+        });
+    }
+
+    // ----- Pantalla: reglas, antes del chat -----
+
+    fn show_brief(&mut self, ui: &mut egui::Ui) {
+        if self.brief_draft.is_none() {
+            self.screen = DockScreen::Chat;
+            return;
+        }
+        Self::paint_panel_background(ui, self.expanded);
+        let inner = self.content_rect(ui);
+        let mut back = false;
+        let mut confirm = false;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let back_label = if self.brief_next == BriefNext::ReturnToChat {
+                        "Chat"
+                    } else {
+                        "Modelo"
+                    };
+                    if Self::command_button(ui, Some(Mark::Back), back_label) {
+                        back = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.expand_control(ui);
+                    });
+                });
+                Self::header(
+                    ui,
+                    "Reglas del chat",
+                    Some("Elegí varias y escribí lo que falte. Rigen toda la charla."),
+                );
+                ui.add_space(8.0);
+
+                let button_h = 40.0;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - button_h).max(80.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.show_brief_body(ui);
+                    });
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    let label = if self.brief_next == BriefNext::ReturnToChat {
+                        "Guardar reglas"
+                    } else if self.develop_plan_id.is_some() {
+                        "Entrar y desarrollar"
+                    } else if self.plan_generate_after_pick {
+                        "Entrar y armar el plan"
+                    } else {
+                        "Entrar al chat"
+                    };
+                    if Self::primary_button(ui, label, true, true) {
+                        confirm = true;
+                    }
+                });
+            });
+        });
+        if back {
+            self.brief_draft = None;
+            self.screen = if self.brief_next == BriefNext::ReturnToChat {
+                DockScreen::Chat
+            } else {
+                DockScreen::PickModel
+            };
+        } else if confirm {
+            self.confirm_brief(ui.ctx());
+        }
+    }
+
+    fn show_brief_body(&mut self, ui: &mut egui::Ui) {
+        let write_code = self
+            .brief_draft
+            .as_ref()
+            .is_some_and(|draft| draft.write_code);
+        let card = Self::card(ui, write_code, |ui| {
+            ui.label(
+                egui::RichText::new(if write_code {
+                    "Puede escribir código"
+                } else {
+                    "No toca archivos"
+                })
+                .strong()
+                .size(13.0)
+                .color(palette::TEXT),
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(if write_code {
+                        "Crea y modifica archivos, muestra una vista previa mientras lo hace y, al terminar, lista los cambios."
+                    } else {
+                        "Sólo conversa. No aplica cambios en el proyecto."
+                    })
+                    .size(10.5)
+                    .color(palette::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        });
+        if card.clicked() {
+            if let Some(draft) = self.brief_draft.as_mut() {
+                draft.write_code = !draft.write_code;
+            }
+        }
+        ui.add_space(10.0);
+        self.show_rule_group(
+            ui,
+            "No debe hacer",
+            "Lo que queda prohibido en este chat.",
+            brief::RuleGroup::Forbid,
+        );
+        self.show_rule_group(
+            ui,
+            "Sí o sí debe hacer",
+            "Lo que tiene que cumplir al trabajar.",
+            brief::RuleGroup::Require,
+        );
+        self.show_rule_group(
+            ui,
+            "Tener en cuenta",
+            "Lo que no puede olvidar durante la charla.",
+            brief::RuleGroup::Remember,
+        );
+    }
+
+    fn show_rule_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        hint: &str,
+        group: brief::RuleGroup,
+    ) {
+        ui.label(
+            egui::RichText::new(title)
+                .strong()
+                .size(12.5)
+                .color(palette::TEXT),
+        );
+        ui.label(
+            egui::RichText::new(hint)
+                .size(10.0)
+                .color(palette::TEXT_MUTED),
+        );
+        ui.add_space(4.0);
+        let mut toggle: Option<&'static str> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for preset in brief::presets(group) {
+                let on = self
+                    .brief_draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.is_on(preset.id));
+                if Self::toggle_chip(ui, preset.label, on) {
+                    toggle = Some(preset.id);
+                }
+            }
+        });
+        if let Some(id) = toggle {
+            if let Some(draft) = self.brief_draft.as_mut() {
+                draft.toggle(id);
+            }
+        }
+        ui.add_space(4.0);
+        if let Some(draft) = self.brief_draft.as_mut() {
+            let note = match group {
+                brief::RuleGroup::Forbid => &mut draft.forbid_note,
+                brief::RuleGroup::Require => &mut draft.require_note,
+                brief::RuleGroup::Remember => &mut draft.remember_note,
+            };
+            ui.add(
+                egui::TextEdit::multiline(note)
+                    .hint_text("Escribí otra restricción…")
+                    .desired_rows(2)
+                    .desired_width(ui.available_width())
+                    .margin(egui::vec2(8.0, 6.0)),
+            );
+        }
+        ui.add_space(12.0);
+    }
+
     // ----- Pantalla: chat -----
 
     fn show_work_card(ui: &mut egui::Ui, pending: &PendingReply, max_w: f32) {
@@ -3105,6 +3625,7 @@ impl YeisonDock {
         let badge_fill = match work.source {
             WorkSource::Brain => palette::OK,
             WorkSource::Tokens => palette::ACCENT,
+            WorkSource::Code => palette::WARN,
         };
         let time = ui.input(|i| i.time) as f32;
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -3164,7 +3685,7 @@ impl YeisonDock {
                             "Brain ~{} tok · sin gasto de API todavía",
                             work.brain_tokens
                         ),
-                        WorkSource::Tokens => format!(
+                        WorkSource::Tokens | WorkSource::Code => format!(
                             "Prompt ~{} · salida ~{} · Brain ~{} tok",
                             work.prompt_tokens, work.output_tokens, work.brain_tokens
                         ),
@@ -3174,6 +3695,44 @@ impl YeisonDock {
                             .size(9.5)
                             .color(palette::TEXT_MUTED),
                     );
+                    if !pending.touched.is_empty() {
+                        ui.add_space(4.0);
+                        let list = pending
+                            .touched
+                            .iter()
+                            .map(|path| short_path(path, 28))
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        ui.label(
+                            egui::RichText::new(format!("En este turno: {list}"))
+                                .size(9.5)
+                                .color(palette::TEXT_DIM),
+                        );
+                    }
+                    if let Some(preview) = work.preview.as_deref().filter(|text| !text.trim().is_empty())
+                    {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Vista previa")
+                                .size(9.5)
+                                .strong()
+                                .color(palette::TEXT_MUTED),
+                        );
+                        ui.add_space(2.0);
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(24, 25, 32))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(preview)
+                                        .monospace()
+                                        .size(9.5)
+                                        .color(palette::TEXT),
+                                );
+                            });
+                    }
                 });
         });
         ui.ctx().request_repaint_after(Duration::from_millis(80));
@@ -3202,7 +3761,12 @@ impl YeisonDock {
             Some(mode) => format!("{} · {}", mode.title(), model_label),
             None => model_label,
         };
-        (agent.provider.display_name.clone(), sub)
+        let writes = self
+            .active()
+            .and_then(|project| project.chats.get(project.active_chat))
+            .is_some_and(|slot| slot.brief.write_code);
+        let code = if writes { " · escribe código" } else { "" };
+        (agent.provider.display_name.clone(), format!("{sub}{code}"))
     }
 
     fn markdown_theme(role: MessageRole) -> markdown::Theme {
@@ -3470,6 +4034,9 @@ impl YeisonDock {
                         if Self::ghost_button(ui, "Modelo") {
                             self.open_model_picker();
                         }
+                        if Self::ghost_button(ui, "Reglas") {
+                            self.open_brief(BriefNext::ReturnToChat);
+                        }
                         let last_plan = self
                             .active()
                             .and_then(|p| p.plans.len().checked_sub(1));
@@ -3523,8 +4090,13 @@ impl YeisonDock {
                     .active()
                     .and_then(|p| p.chats.get(chat))
                     .is_some_and(|slot| slot.agent.is_some());
+                let working = self
+                    .active()
+                    .and_then(|project| project.chats.get(chat))
+                    .is_some_and(|slot| slot.pending.is_some());
                 let input_h = 46.0;
-                let messages_h = (ui.available_height() - input_h).max(60.0);
+                let work_h = if working { 120.0 } else { 0.0 };
+                let messages_h = (ui.available_height() - input_h - work_h).max(48.0);
                 let max_bubble_w = ui.available_width() * 0.88;
                 egui::ScrollArea::vertical()
                     .max_height(messages_h)
@@ -3552,6 +4124,14 @@ impl YeisonDock {
                                             .size(11.0)
                                             .color(palette::TEXT_MUTED),
                                     );
+                                    if slot.brief.confirmed {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new(slot.brief.summary_line())
+                                                .size(10.5)
+                                                .color(palette::TEXT_DIM),
+                                        );
+                                    }
                                 } else {
                                     ui.label(
                                         egui::RichText::new("Este chat no tiene modelo")
@@ -3570,15 +4150,17 @@ impl YeisonDock {
                         for message in &slot.messages {
                             if message.role == MessageRole::Note {
                                 markdown::show(ui, &message.text, &Self::markdown_theme(message.role));
-                            } else {
+                            } else if !message.text.trim().is_empty() {
                                 Self::bubble(ui, message.role, &message.text, max_bubble_w, false);
+                            }
+                            if !message.changes.is_empty() {
+                                ui.add_space(4.0);
+                                Self::show_changes(ui, &message.changes, max_bubble_w);
                             }
                             ui.add_space(6.0);
                         }
                         if let Some(pending) = &slot.pending {
-                            Self::show_work_card(ui, pending, max_bubble_w);
                             if !pending.text.trim().is_empty() {
-                                ui.add_space(6.0);
                                 Self::bubble(
                                     ui,
                                     MessageRole::Assistant,
@@ -3590,6 +4172,15 @@ impl YeisonDock {
                             ui.add_space(6.0);
                         }
                     });
+
+                if let Some(pending) = self
+                    .active()
+                    .and_then(|project| project.chats.get(chat))
+                    .and_then(|slot| slot.pending.as_ref())
+                {
+                    ui.add_space(4.0);
+                    Self::show_work_card(ui, pending, ui.available_width());
+                }
 
                 let mut pick_model = false;
                 let mut cancel_reply = false;
@@ -3965,6 +4556,7 @@ impl eframe::App for YeisonDock {
                 DockScreen::PickProject => self.show_pick_project(ui),
                 DockScreen::PickProvider => self.show_pick_provider(ui),
                 DockScreen::PickModel => self.show_pick_model(ui),
+                DockScreen::Brief => self.show_brief(ui),
                 DockScreen::Chat => self.show_chat(ui),
                 DockScreen::Plan => self.show_plan(ui),
             });

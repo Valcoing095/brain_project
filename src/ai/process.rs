@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Límite por defecto para una respuesta completa de un agente.
-pub const AGENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Una respuesta que lee el repo y arma un plan puede tardar bastante más que un comando corto.
+pub const TURN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Límite para comandos de inspección (listar modelos, estado, `--help`).
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Límite corto para sondear binarios desconocidos del PATH.
@@ -20,7 +21,7 @@ pub fn new_cancel_flag() -> CancelFlag {
 }
 
 pub fn run_command(bin: &Path, args: &[&str], cwd: &Path) -> Result<String, String> {
-    run_command_timeout(bin, args, cwd, AGENT_TIMEOUT)
+    run_command_timeout(bin, args, cwd, TURN_TIMEOUT)
 }
 
 pub fn run_command_timeout(

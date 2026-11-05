@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use super::catalog::{ProviderEntry, ProviderKind};
-use super::process::{run_command, run_command_streaming, CancelFlag, AGENT_TIMEOUT};
+use super::process::{run_command, run_command_streaming, CancelFlag, TURN_TIMEOUT};
 use crate::cursor_agent::AgentMode;
 
 static WORKSPACE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
@@ -52,12 +52,14 @@ impl SessionState {
 /// Eventos emitidos mientras el agente responde.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
-    /// El agente está razonando (texto parcial del pensamiento).
-    Thinking,
+    /// El agente está razonando. `text` es el fragmento nuevo, si vino en el stream.
+    Thinking { text: String },
     /// Fragmento incremental de la respuesta.
     Delta(String),
     /// Texto completo acumulado hasta ahora (reemplaza lo anterior).
     Replace(String),
+    /// Qué está haciendo ahora: archivo, comando o un recorte del código.
+    Activity(crate::edits::Activity),
 }
 
 pub fn init_workspace(default: PathBuf) {
@@ -248,7 +250,7 @@ fn send_cursor(
     let mut final_result: Option<String> = None;
     let mut error_result: Option<String> = None;
 
-    let stderr = run_command_streaming(&bin, &arg_refs, ws, AGENT_TIMEOUT, cancel, |line| {
+    let stderr = run_command_streaming(&bin, &arg_refs, ws, TURN_TIMEOUT, cancel, |line| {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
@@ -257,8 +259,29 @@ fn send_cursor(
                 session_id = Some(id.to_string());
             }
         }
+        if let Some(mut activity) = crate::edits::activity_from_json(&value) {
+            if let Some(extra) = activity.append.clone() {
+                let extra = extra.trim();
+                if !extra.is_empty() && !accumulated.contains(extra) {
+                    if !accumulated.is_empty() && !accumulated.ends_with('\n') {
+                        accumulated.push_str("\n\n");
+                    }
+                    accumulated.push_str(extra);
+                    on_event(StreamEvent::Replace(accumulated.clone()));
+                }
+            }
+            activity.append = None;
+            on_event(StreamEvent::Activity(activity));
+        }
         match value.get("type").and_then(|v| v.as_str()) {
-            Some("thinking") => on_event(StreamEvent::Thinking),
+            Some("thinking") => {
+                let text = value
+                    .get("text")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                on_event(StreamEvent::Thinking { text });
+            }
             Some("assistant") => {
                 let text = value
                     .pointer("/message/content")
@@ -273,12 +296,16 @@ fn send_cursor(
                 if text.is_empty() {
                     return;
                 }
-                if value.get("timestamp_ms").is_some() {
-                    accumulated.push_str(&text);
-                    on_event(StreamEvent::Delta(text));
-                } else {
-                    accumulated = text.clone();
-                    on_event(StreamEvent::Replace(text));
+                match crate::edits::absorb_assistant(&accumulated, &text) {
+                    crate::edits::Absorb::Ignore => {}
+                    crate::edits::Absorb::Append(chunk) => {
+                        accumulated.push_str(&chunk);
+                        on_event(StreamEvent::Delta(chunk));
+                    }
+                    crate::edits::Absorb::Replace(full) => {
+                        accumulated = full.clone();
+                        on_event(StreamEvent::Replace(full));
+                    }
                 }
             }
             Some("result") => {
@@ -318,13 +345,10 @@ fn send_cursor(
 
     match stderr {
         Ok(_) => {}
-        Err(e) if accumulated.is_empty() && final_result.is_none() => return Err(e),
-        Err(_) => {}
+        Err(error) => return Err(error),
     }
 
-    let reply = final_result
-        .filter(|r| !r.trim().is_empty())
-        .unwrap_or(accumulated);
+    let reply = crate::edits::choose_reply(&accumulated, final_result.as_deref());
     if reply.trim().is_empty() {
         return Err("Cursor no devolvió texto.".into());
     }
@@ -357,7 +381,7 @@ fn send_opencode(
     let mut parts: Vec<String> = Vec::new();
     let mut error_text: Option<String> = None;
 
-    let stderr = run_command_streaming(bin, &args, ws, AGENT_TIMEOUT, cancel, |line| {
+    let stderr = run_command_streaming(bin, &args, ws, TURN_TIMEOUT, cancel, |line| {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
@@ -366,8 +390,13 @@ fn send_opencode(
                 session_id = Some(id.to_string());
             }
         }
+        if let Some(activity) = crate::edits::activity_from_json(&value) {
+            on_event(StreamEvent::Activity(activity));
+        }
         match value.get("type").and_then(|v| v.as_str()) {
-            Some("step_start") => on_event(StreamEvent::Thinking),
+            Some("step_start") => on_event(StreamEvent::Thinking {
+                text: String::new(),
+            }),
             Some("text") => {
                 if let Some(text) = value.pointer("/part/text").and_then(|t| t.as_str()) {
                     if !text.trim().is_empty() {
